@@ -1,0 +1,16 @@
+*.rpm
+*.log
+*.json
+SHA256SUMS*
+NEW-SHA256SUMS*
+OLD-SHA256SUMS*
+*.key
+*.asc
+*.gpg
+!release-keyring.gpg
+signing/
+gnupg*/
+private*/
+build/
+work/
+*.part

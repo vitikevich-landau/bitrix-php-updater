@@ -1,0 +1,3604 @@
+#!/usr/bin/env bash
+# Bitrix Server Master 1.0.0-rc8 — диагностика и пилотное обновление PHP 8.2.35.
+set -o pipefail
+umask 077
+export LC_ALL=C
+MASTER_VERSION='1.0.0-rc8'
+PY_RELEASE='3.11.18'
+PY_BUILD='20261026'
+PY_ARTIFACT='cpython-3.11.18+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
+PY_SHA256='17c4978a36c496dc53c08899ef8dad1ad2734f6325f08d6033a1e66419e0af26'
+PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_BUILD}/${PY_ARTIFACT}"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+
+help_ru() { update_help; }
+
+python_is_ok() {
+    local c="$1"
+    [ -n "$c" ] && [ -x "$c" ] || return 1
+    "$c" -B -c 'import sys; sys.exit(0 if (3,8) <= sys.version_info[:2] < (4,0) else 1)' >/dev/null 2>&1
+}
+
+python_path() {
+    local base candidate
+    if [ "$(id -u)" = '0' ]; then
+        base='/opt/bitrix-server-master'
+    else
+        base="${HOME:-/tmp}/.local/share/bitrix-server-master"
+    fi
+    candidate="$base/runtime-${PY_RELEASE}/bin/python3"
+    if python_is_ok "$candidate"; then printf '%s' "$candidate"; return 0; fi
+    for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            local found
+            found="$(command -v "$candidate")"
+            if python_is_ok "$found"; then printf '%s' "$found"; return 0; fi
+        fi
+    done
+    return 1
+}
+
+bootstrap_python() {
+    local archive="$1" response base parent target tmp url result available_kb
+    if [ ! -t 0 ]; then
+        echo 'ОШИБКА: установка Python требует интерактивного подтверждения в SSH.' >&2
+        return 5
+    fi
+    if [ "$(uname -s)" != 'Linux' ] || [ "$(uname -m)" != 'x86_64' ]; then
+        echo 'ОШИБКА: изолированный Python поддержан пока только для Linux x86_64.' >&2
+        return 5
+    fi
+    if ! command -v sha256sum >/dev/null || ! command -v tar >/dev/null || ! command -v mktemp >/dev/null; then
+        echo 'ОШИБКА: необходимы sha256sum, tar и mktemp.' >&2
+        return 5
+    fi
+    if [ "$(id -u)" = '0' ]; then
+        base='/opt/bitrix-server-master'
+    else
+        base="${HOME:-/tmp}/.local/share/bitrix-server-master"
+    fi
+    target="$base/runtime-${PY_RELEASE}"
+    if python_is_ok "$target/bin/python3"; then
+        echo "Изолированный Python уже установлен: $target/bin/python3"
+        return 0
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        echo "ОШИБКА: каталог уже существует, но Python не работает: $target" >&2
+        echo 'Автоматически чужие файлы не перезаписываем.' >&2
+        return 5
+    fi
+    echo
+    echo 'Предлагается установить отдельный Python 3.11.18.'
+    echo "Место установки: $target"
+    echo "Источник: ${archive:-$PY_URL}"
+    echo "Ожидаемый SHA-256: $PY_SHA256"
+    echo 'Системный /usr/bin/python, yum, PHP, Apache и конфигурации не изменяются.'
+    echo 'Будет создан отдельный каталог и временные файлы для проверки архива.'
+    printf 'Подтвердить установку? Введите ДА (заглавными буквами): '
+    IFS= read -r response
+    if [ "$response" != 'ДА' ]; then
+        echo 'Отменено. Изменений нет.'
+        return 4
+    fi
+    parent="$(dirname "$base")"
+    if ! mkdir -p -- "$base"; then
+        echo "ОШИБКА: не удалось создать $base" >&2
+        return 5
+    fi
+    available_kb="$(df -Pk "$base" 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -n "$available_kb" ] && [ "$available_kb" -lt 300000 ] 2>/dev/null; then
+        echo 'ОШИБКА: для безопасной подготовки Python нужно минимум 300 МиБ свободно.' >&2
+        return 5
+    fi
+    tmp="$(mktemp -d "$base/.python-stage.XXXXXXXX")" || return 5
+    if [ -n "$archive" ]; then
+        if [ ! -f "$archive" ] || [ -L "$archive" ]; then
+            echo 'ОШИБКА: локальный архив не найден или является символической ссылкой.' >&2
+            rm -rf -- "$tmp"
+            return 5
+        fi
+        if ! cp -- "$archive" "$tmp/archive.tar.gz"; then
+            echo 'ОШИБКА: не удалось скопировать локальный архив.' >&2
+            rm -rf -- "$tmp"
+            return 5
+        fi
+    else
+        if ! command -v curl >/dev/null 2>&1; then
+            echo 'ОШИБКА: curl отсутствует. Используйте --python-archive.' >&2
+            rm -rf -- "$tmp"
+            return 5
+        fi
+        echo 'Скачивание Python по HTTPS (без -k / --insecure)...'
+        if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+                  --connect-timeout 12 --max-time 240 --output "$tmp/archive.tar.gz" "$PY_URL"; then
+            echo 'ОШИБКА: скачивание не удалось. Системные пакеты не тронуты.' >&2
+            rm -rf -- "$tmp"
+            return 5
+        fi
+    fi
+    if ! printf '%s  %s\n' "$PY_SHA256" "$tmp/archive.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+        echo 'ОШИБКА: SHA-256 архива не совпал с закреплённым значением. Распаковка запрещена.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    echo 'Контрольная сумма совпала. Проверяю содержимое архива...'
+    if ! tar -tzf "$tmp/archive.tar.gz" >"$tmp/entries" 2>/dev/null; then
+        echo 'ОШИБКА: неверный формат архива.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    # Блокируем абсолютные пути и выход за пределы python/. Проверяем каждый компонент.
+    if awk '/^\// || /(^|\/)\.\.($|\/)/ || !/^python\// {bad=1} END{exit bad}' "$tmp/entries"; then
+        :
+    else
+        echo 'ОШИБКА: архив содержит небезопасные пути.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    if ! tar --no-same-owner --no-same-permissions -xzf "$tmp/archive.tar.gz" -C "$tmp"; then
+        echo 'ОШИБКА: не удалось распаковать архив.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    if ! python_is_ok "$tmp/python/bin/python3"; then
+        echo 'ОШИБКА: проверка нового Python не прошла (возможно несовместимая ОС).' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        echo 'ОШИБКА: целевой каталог появился во время операции.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    if ! mv -- "$tmp/python" "$target"; then
+        echo 'ОШИБКА: не удалось завершить развёртывание.' >&2
+        rm -rf -- "$tmp"
+        return 5
+    fi
+    rm -rf -- "$tmp"
+    echo "Готово: $target/bin/python3"
+    echo 'Системный Python и пакеты ОС не изменялись.'
+    return 0
+}
+
+# Отдельный строго ограниченный диагностический режим для серверов без Python 3.
+# Ничего не устанавливает; не опрашивает сетевые ресурсы.
+fallback_diagnose() {
+    local json=0 report='' check=0 offline=0 args=("$@") x osname= arch= phpv= bitrix= apache= nginx= droot= mem= hostname_local
+    local os_id os_major first_version
+    for ((x=0;x<${#args[@]};x++)); do
+        case "${args[x]}" in
+            --json) json=1 ;;
+            --report)
+                report='AUTO'
+                if [ $((x+1)) -lt ${#args[@]} ] && [[ "${args[x+1]}" != -* ]]; then
+                    report="${args[x+1]}"; ((x++))
+                fi ;;
+            --report=*) report="${args[x]#*=}" ;;
+            --check-updates) check=1 ;;
+            --offline) offline=1 ;;
+            --compare|--url) echo 'Без Python 3 этот режим недоступен. Используйте --bootstrap-python.' >&2; return 6 ;;
+        esac
+    done
+    osname="$(sed -n '/^PRETTY_NAME=/{s/^PRETTY_NAME=//;s/^"//;s/"$//;p;q;}' /etc/os-release 2>/dev/null)"
+    [ -n "$osname" ] || osname="$(uname -s)"
+    arch="$(uname -m)"
+    phpv="$(php -v 2>/dev/null | awk '$1 == "PHP" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+_-]*$/ && !found {print $2; found=1}')" || phpv=''
+    [ -n "$phpv" ] || phpv='не обнаружен'
+    apache="$(systemctl is-active httpd 2>/dev/null || true)"
+    nginx="$(systemctl is-active nginx 2>/dev/null || true)"
+    droot="$(df -h / 2>/dev/null | awk 'NR==2 {print $4}')"
+    mem="$(awk '/^MemAvailable:/ {printf "%.0f МиБ", $2/1024}' /proc/meminfo 2>/dev/null)"
+    bitrix='не обнаружен'
+    [ -d /etc/httpd/bx ] || [ -d /home/bitrix/www/bitrix ] && bitrix='обнаружен (версия не проверена)'
+    hostname_local="$(hostname 2>/dev/null || printf 'unknown')"
+    # Escapes JSON without requiring Python or jq.
+    json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"; printf '%s' "$s" | tr -d '\000-\037'; }
+    local output
+    output="$(printf '{"schema":"bitrix-server-master/fallback-v1","version":"%s","hostname":"%s","os":"%s","architecture":"%s","php_cli":"%s","bitrix":"%s","apache":"%s","nginx":"%s","root_free":"%s","mem_available":"%s","limited":true,"readonly":true,"web_php_confirmed":false,"update_status":"unknown"}' \
+      "$MASTER_VERSION" "$(json_escape "$hostname_local")" "$(json_escape "$osname")" "$(json_escape "$arch")" "$(json_escape "$phpv")" "$(json_escape "$bitrix")" "$(json_escape "$apache")" "$(json_escape "$nginx")" "$(json_escape "$droot")" "$(json_escape "$mem")")"
+    if [ "$json" -eq 1 ]; then
+        printf '%s\n' "$output"
+    else
+        os_id="$(sed -n '/^ID=/{s/^ID=//;s/"//g;p;q;}' /etc/os-release 2>/dev/null)"
+        os_major="$(sed -n '/^VERSION_ID=/{s/^VERSION_ID=//;s/"//g;s/\..*//;p;q;}' /etc/os-release 2>/dev/null)"
+        echo '======================================================'
+        echo "BITRIX SERVER MASTER $MASTER_VERSION — ОГРАНИЧЕННАЯ ДИАГНОСТИКА"
+        echo '======================================================'
+        if [[ "$phpv" == "$TARGET_PHP" ]]; then
+            status_line ok "PHP CLI $phpv — обновление до целевой версии не требуется"
+        elif [[ "$phpv" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            first_version="$(printf '%s\n' "$phpv" "$TARGET_PHP" | sort -V | head -n 1)"
+            if [[ "$first_version" == "$phpv" ]]; then
+                status_line warning "PHP CLI $phpv — версия ниже целевой $TARGET_PHP"
+            else
+                status_line info "PHP CLI $phpv — версия выше целевой $TARGET_PHP"
+            fi
+        elif [[ "$phpv" == 'не обнаружен' ]]; then
+            status_line warning "PHP CLI — версия не определена (цель $TARGET_PHP)"
+        else
+            status_line warning "PHP CLI $phpv — не удалось сравнить с целевой версией $TARGET_PHP"
+        fi
+        if [ "$offline" -eq 1 ]; then
+            status_line info 'PHP.net — проверка пропущена (--offline)'
+        elif [ "$check" -eq 1 ]; then
+            status_line info 'PHP.net — проверка недоступна без Python 3.8+'
+        else
+            status_line info 'PHP.net — проверка не запрошена'
+        fi
+        status_line warning 'PHP сайта не подтверждён'
+        case "$os_id:$os_major" in
+            centos:7|centos:8|rhel:7)
+                status_line critical "ОС $osname — поддержка завершилась" ;;
+            *)
+                status_line info "ОС $osname — срок поддержки не определён" ;;
+        esac
+        if [ "$os_id:$os_major" = centos:7 ] && [[ "$phpv" =~ ^(5|7|8\.[01])\. ]]; then
+            status_line info 'Следующий шаг — bash install.sh --plan'
+        fi
+        status_line info 'Для полного аудита доступен отдельный Python через bash install.sh --bootstrap-python.'
+        echo
+        echo 'ПОДРОБНОСТИ'
+        echo "Сервер:               $hostname_local"
+        echo "Архитектура:          $arch"
+        echo "BitrixEnv:            $bitrix"
+        echo "Apache:               ${apache:-не определено}"
+        echo "Nginx:                ${nginx:-не определено}"
+        echo "Место на /:           ${droot:-не определено}"
+        echo "Доступная память:     ${mem:-не определено}"
+        echo 'Рабочая конфигурация и службы не изменены.'
+    fi
+    if [ -n "$report" ]; then
+        if [ "$report" = 'AUTO' ]; then report="./bitrix-audit-$(date -u +%Y%m%d-%H%M%S)-fallback.json"; fi
+        if (set -C; printf '%s\n' "$output" > "$report"); then
+            echo "Отчёт сохранён: $report" >&2
+        else
+            echo "Ошибка записи отчёта (файл существует или нет доступа): $report" >&2
+            return 3
+        fi
+    fi
+}
+
+
+# =============================================================================
+# Bitrix Server Master — обновление для строго определённого профиля CentOS 7.
+# Код Bash не требует Python и никогда не исполняет содержимое сайта.
+# =============================================================================
+TARGET_PHP='8.2.35'
+TARGET_PHP_SHA='5737b98601fe5ab1b8c5db0c82ed3158acb9283ed3081ffe2faffb9ac81455e6'
+SRC_RPM_URL='https://rpms.remirepo.net/SRPMS/php-8.2.35-1.remi.src.rpm'
+SRC_RPM_SHA256='3e378af07d6beae83e507ba7331fbf70851cd365940a07a69ce6e3fc7fc35c00'
+UPDATER_STATE='/var/lib/bitrix-server-master'
+UPDATER_LOG='/var/log/bitrix-server-master'
+WORK_ROOT='/var/lib/bitrix-server-master/work'
+# Имена только штатных RPM, которые можно обновлять совместно.
+CORE_RPM_NAMES='php php-cli php-common php-gd php-ldap php-mbstring php-mysqlnd php-opcache php-pdo php-process php-pspell php-sodium php-xml php-bcmath php-dba php-devel php-embedded php-enchant php-ffi php-fpm php-gmp php-imap php-intl php-litespeed php-odbc php-pdo-dblib php-pdo-firebird php-pgsql php-snmp php-soap php-tidy php-dbg php-debuginfo'
+
+msg() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+err() { printf '\nОШИБКА: %s\n' "$*" >&2; }
+warn() { printf '\nВНИМАНИЕ: %s\n' "$*" >&2; }
+status_line() {
+    local label color
+    case "$1" in
+        ok)       label='OK';       color=32 ;;
+        warning)  label='ВНИМАНИЕ'; color=33 ;;
+        critical) label='КРИТИЧНО'; color=31 ;;
+        info)     label='ИНФО';     color=36 ;;
+    esac
+    if [[ -t 1 && "${TERM:-}" != dumb && -z "${NO_COLOR:-}" ]]; then
+        printf '\033[%sm[%s] %s\033[0m\n' "$color" "$label" "$2"
+    else
+        printf '[%s] %s\n' "$label" "$2"
+    fi
+}
+
+require_root() { if [ "$(id -u)" -ne 0 ]; then err 'Для этой операции нужны права root.'; return 10; fi; }
+need() { local c; for c in "$@"; do if ! command -v "$c" >/dev/null 2>&1; then err "Не найдена программа: $c"; return 11; fi; done; }
+confirm_phrase() {
+    local label="$1" phrase="$2" input
+    if [ ! -t 0 ]; then err "Для действия «$label» нужен интерактивный терминал."; return 12; fi
+    echo
+    printf '%s\n' "$label"
+    printf 'Для подтверждения введите точно: %s\n> ' "$phrase"
+    IFS= read -r input || return 12
+    if [ "$input" != "$phrase" ]; then msg 'Операция отменена, подтверждение не получено.'; return 12; fi
+}
+platform_check() {
+    local ID='' VERSION_ID=''
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+    fi
+    [ "$ID" = centos ] && [[ "$VERSION_ID" =~ ^7(\.[0-9]+)*$ ]] || {
+        err "Профиль поддерживает только CentOS 7 (обнаружено: $ID $VERSION_ID)."; return 20;
+    }
+    [ "$(uname -m)" = x86_64 ] || { err 'Поддерживается только x86_64.'; return 20; }
+}
+
+profile_check() {
+    local cur p_php p_cli apache package_kinds
+    platform_check || return
+    [ -d /etc/httpd/bx ] || { err 'Конфигурация BitrixEnv /etc/httpd/bx не обнаружена.'; return 20; }
+    need rpm php httpd systemctl awk grep sed || return 20
+    cur="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || { err 'PHP CLI не отвечает.'; return 20; }
+    [[ "$cur" =~ ^8\.2\.[0-9]+$ ]] || { err "Обновление поддерживает только ветку PHP 8.2.x (найдено: $cur)."; return 20; }
+    p_php="$(rpm -q --qf '%{VERSION}' php 2>/dev/null)" || { err 'RPM php не установлен.'; return 20; }
+    p_cli="$(rpm -q --qf '%{VERSION}' php-cli 2>/dev/null)" || { err 'RPM php-cli не установлен.'; return 20; }
+    [[ "$p_php" = "$cur" && "$p_cli" = "$cur" ]] || { err "Версии CLI ($cur) и RPM php/php-cli ($p_php/$p_cli) различаются."; return 20; }
+    # Профиль mod_php + prefork. FPM и иные конфигурации пока сознательно блокируются.
+    apache="$(httpd -M 2>/dev/null)" || { err 'httpd -M завершился ошибкой.'; return 20; }
+    grep -Eq '^[[:space:]]*php_module \(shared\)[[:space:]]*$' <<< "$apache" || {
+        err 'mod_php не обнаружен. PHP-FPM пока не поддерживается сценарием установки.'; return 20;
+    }
+    grep -Eq '^[[:space:]]*mpm_prefork_module \(shared\)[[:space:]]*$' <<< "$apache" || {
+        err 'Apache MPM отличается от prefork.'; return 20;
+    }
+    # Проверяем весь вывод и код возврата rpm; grep -q в конвейере может вызвать SIGPIPE.
+    package_kinds="$(rpm -qa --qf '%{NAME}\n' | awk '
+        $0 == "php-fpm" { fpm = 1 }
+        /^(rh-)?php[0-9][0-9](-|$)/ { scl = 1 }
+        END { if (NR == 0) exit 1; print fpm + 0, scl + 0 }
+    ')" || { err 'Не удалось прочитать полный список установленных RPM.'; return 20; }
+    if [[ "$package_kinds" == '1 '* ]] || systemctl is-active --quiet php-fpm; then
+        err 'Обнаружен php-fpm. Автоматическая установка при смешанном PHP-окружении заблокирована.'; return 20
+    fi
+    if [[ "$package_kinds" == *' 1' ]]; then
+        err 'Обнаружены параллельные SCL-пакеты PHP; ручная проверка обязательна.'; return 20
+    fi
+    PHP_CURRENT="$cur"
+    printf 'Поддерживаемый профиль: CentOS 7 x86_64, BitrixEnv, Apache prefork/mod_php, PHP %s\n' "$cur"
+    return 0
+}
+
+available_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2{print $4+0}'; }
+check_disk() {
+    local path="$1" min="$2" av
+    av="$(available_mb "$path")"
+    [ -n "$av" ] && [ "$av" -ge "$min" ] || { err "Недостаточно места в $path: ${av:-?} МиБ, необходимо не менее $min МиБ."; return 21; }
+}
+
+private_session_dir() {
+    [ -d "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%u:%a' -- "$1")" = '0:700' ]
+}
+
+private_session_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%u:%a:%h' -- "$1")" = '0:600:1' ]
+}
+
+ensure_session_dir() {
+    if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        mkdir -m 0700 -- "$1" 2>/dev/null || true
+    fi
+    private_session_dir "$1" || { err "Небезопасный каталог сессий: $1"; return 22; }
+}
+
+session_setup() {
+    # Значения из окружения не дают права повторно использовать сессию или пропустить блокировку.
+    SESSION_NAME=''
+    SESSION_DIR=''
+    LOG_FILE=''
+    require_root || return
+    need flock mkdir date tee stat mktemp mv || return
+    ensure_session_dir "$UPDATER_STATE" || return
+    if [ -e "$UPDATER_STATE/.lock" ] || [ -L "$UPDATER_STATE/.lock" ]; then
+        private_session_file "$UPDATER_STATE/.lock" || { err 'Небезопасный файл блокировки.'; return 22; }
+    fi
+    exec 9>>"$UPDATER_STATE/.lock" || return
+    flock -n 9 || { err 'Другой экземпляр мастера уже выполняет операцию.'; return 22; }
+    ensure_session_dir "$UPDATER_STATE/sessions" || return
+    ensure_session_dir "$UPDATER_LOG" || return
+    ensure_session_dir "$WORK_ROOT" || return
+    SESSION_NAME="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
+    SESSION_DIR="$UPDATER_STATE/sessions/$SESSION_NAME"
+    mkdir -m 0700 -- "$SESSION_DIR" || return
+    LOG_FILE="$UPDATER_LOG/$SESSION_NAME.log"
+    (set -o noclobber; : > "$LOG_FILE") || return
+    # Журнал не держит блокировку после завершения операции.
+    exec > >(tee -a -- "$LOG_FILE" 9>&-) 2>&1
+    msg "Сессия $SESSION_NAME. Журнал: $LOG_FILE"
+    mark_state started
+}
+
+mark_state() {
+    local tmp
+    tmp="$(mktemp "$SESSION_DIR/.state.XXXXXX")" || return
+    if ! { printf '%s\n' "$1" > "$tmp" && mv -f -- "$tmp" "$SESSION_DIR/state"; }; then
+        rm -f -- "$tmp"
+        err "Не удалось записать состояние сессии: $1"
+        return 22
+    fi
+}
+
+show_os_status() {
+    local ID='' VERSION_ID='' PRETTY_NAME=''
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+    fi
+    if [[ "$ID" == centos && "$VERSION_ID" =~ ^7(\.[0-9]+)*$ ]]; then
+        status_line warning 'ОС: CentOS 7 снята с поддержки.'
+    elif [ -n "$ID" ]; then
+        status_line info "ОС: ${PRETTY_NAME:-$ID $VERSION_ID}."
+    else
+        status_line warning 'ОС: не удалось определить версию.'
+    fi
+}
+
+php_rpm_versions_check() {
+    local inventory
+    inventory="$(inventory_php_rpms)" || return 2
+    awk -F'|' -v version="$1" 'NF != 5 || $3 != version { print $1 " " $3; exit 1 }' <<< "$inventory" >&2
+}
+
+target_php_status() {
+    local detail rpm_rc=0
+    detail="$(php_rpm_versions_check "$TARGET_PHP" 2>&1)" || rpm_rc=$?
+    if [ "$rpm_rc" -eq 0 ]; then
+        status_line ok "PHP CLI $TARGET_PHP — обновлять до $TARGET_PHP не нужно. Версии основных RPM совпадают."
+        return 0
+    fi
+
+    status_line info "PHP CLI $TARGET_PHP — обновлять до $TARGET_PHP не нужно."
+    if [ "$rpm_rc" -eq 1 ]; then
+        status_line critical "RPM отличаются от PHP CLI. Первое расхождение — $detail."
+    else
+        detail="${detail##*$'\n'}"
+        detail="${detail#ОШИБКА: }"
+        status_line warning "RPM не подтверждены. ${detail:-Не удалось получить сведения о пакетах.}"
+    fi
+    return 20
+}
+
+php_version_route() {
+    local version="$1" major minor patch
+    if ! [[ "$version" =~ ^(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)\.([0-9]{1,3})$ ]]; then
+        echo unknown
+        return
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[3]}"
+    if [ "$version" = "$TARGET_PHP" ]; then
+        echo target
+    elif [ "$major" -gt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -gt 2 ]; }; then
+        echo newer
+    elif [ "$major" -eq 8 ] && [ "$minor" -eq 2 ]; then
+        if [ "$patch" -ge "${TARGET_PHP##*.}" ]; then echo newer; else echo patch; fi
+    else
+        echo older
+    fi
+}
+
+bitrix_env_release() {
+    local package record installed='' installed_name='' version release arch
+    for package in bitrix-env bitrix-env-crm; do
+        if record="$(rpm -q --qf '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' "$package" 2>/dev/null)"; then
+            if [[ -n "$installed_name" || "$record" == *$'\n'* ]]; then
+                echo 'BitrixEnv — версия неоднозначна: установлено несколько RPM окружения.'
+                return 1
+            fi
+            installed="$record"
+            installed_name="$package"
+        elif [ "$record" != "package $package is not installed" ]; then
+            echo 'BitrixEnv — не удалось прочитать RPM окружения.'
+            return 1
+        fi
+    done
+    if [ -z "$installed_name" ]; then
+        echo 'BitrixEnv — RPM bitrix-env и bitrix-env-crm не найдены.'
+        return 1
+    fi
+    if ! [[ "$installed" =~ ^${installed_name}\|([[:alnum:]_.+~^-]+)\|([[:alnum:]_.+~^-]+)\|([[:alnum:]_]+)$ ]]; then
+        echo 'BitrixEnv — не удалось распознать метаданные RPM окружения.'
+        return 1
+    fi
+    version="${BASH_REMATCH[1]}"
+    release="${BASH_REMATCH[2]}"
+    arch="${BASH_REMATCH[3]}"
+
+    # Стабильные сборки из https://repos.1c-bitrix.ru/yum/el/7/x86_64/.
+    case "$version-$release.$arch" in
+        7.0-[01].el7.centos.noarch|7.1-0.el7.centos.noarch|7.2-[0-2].el7.centos.noarch|\
+        7.3-0.el7.centos.noarch|7.3-[0-4].el7.noarch|7.3-1[2-4].el7.noarch|\
+        7.4-[0-3].el7.noarch|7.4-1[0-3].el7.noarch|7.5-[0-5].el7.noarch)
+            printf '%s.%s|%s|%s-%s-%s.%s\n' "$version" "${release%%.*}" "$installed_name" "$installed_name" "$version" "$release" "$arch"
+            ;;
+        *)
+            printf 'BitrixEnv — стабильный выпуск EL7 не распознан по RPM %s-%s-%s.%s.\n' "$installed_name" "$version" "$release" "$arch"
+            return 1 ;;
+    esac
+}
+
+legacy_php_profile() {
+    local cli="$1" php_path owner rpm_php rpm_cli packages
+    if ! [[ "$cli" =~ ^(5\.6|7\.[0-4]|8\.[01])\.[0-9]+$ ]]; then
+        echo 'Для исходной версии PHP требуется отдельно проверить совместимость и промежуточные шаги.'
+    elif ! [ -d /etc/httpd/bx ]; then
+        echo 'Конфигурация BitrixEnv /etc/httpd/bx не обнаружена.'
+    elif ! php_path="$(command -v php)" || [[ "$php_path" != /* ]] ||
+         ! php_path="$(readlink -f -- "$php_path")" ||
+         ! owner="$(rpm -qf --qf '%{NAME}' "$php_path" 2>/dev/null)" || [ "$owner" != php-cli ]; then
+        echo 'Запускаемый PHP CLI не подтверждён как файл пакета php-cli.'
+    elif ! rpm_php="$(rpm -q --qf '%{VERSION}' php 2>/dev/null)" ||
+         ! rpm_cli="$(rpm -q --qf '%{VERSION}' php-cli 2>/dev/null)" ||
+         [[ "$rpm_php" != "$cli" || "$rpm_cli" != "$cli" ]]; then
+        echo 'Не подтверждено совпадение версий PHP CLI и системных RPM php/php-cli.'
+    elif ! packages="$(rpm -qa --qf '%{NAME}\n' 2>/dev/null)" || [ -z "$packages" ]; then
+        echo 'Не удалось проверить список установленных RPM.'
+    elif grep -qx 'php-fpm' <<< "$packages" || systemctl is-active --quiet php-fpm 2>/dev/null; then
+        echo 'Обнаружен PHP-FPM. Сначала проверьте конфигурацию веб-PHP на клоне.'
+    elif grep -Eq '^(rh-)?php[0-9][0-9](-|$)' <<< "$packages"; then
+        echo 'Обнаружены параллельные пакеты PHP SCL. Сначала проверьте конфигурацию веб-PHP на клоне.'
+    else
+        return 0
+    fi
+    return 1
+}
+
+show_legacy_php_plan() {
+    local cli="$1" bx detail version='' package='' nevra='' route=migrate
+    local package_menu='4. Update packages on host' php_menu='8. Update PHP and MySQL' menu_step=5 php_target=''
+    if [[ "$cli" =~ ^[[:alnum:]_.+~-]+$ ]]; then
+        status_line info "PHP CLI — $cli."
+    else
+        status_line warning 'Версия PHP CLI не определена.'
+    fi
+    show_os_status
+    status_line info "Архитектура — $(uname -m 2>/dev/null || echo 'не определена')."
+    if bx="$(bitrix_env_release)"; then
+        IFS='|' read -r version package nevra <<< "$bx"
+        status_line info "BitrixEnv $version (RPM $nevra)."
+    else
+        status_line warning "$bx"
+    fi
+    if ! detail="$(platform_check 2>&1)"; then
+        detail="${detail##*$'\n'}"
+        status_line warning "${detail#ОШИБКА: }"
+    elif [ -n "$version" ]; then
+        if detail="$(legacy_php_profile "$cli")"; then
+            case "$version" in
+                7.5.[3-5]) route=menu ;;
+                7.*) route=environment ;;
+            esac
+        else
+            route=compatibility
+            status_line warning "$detail"
+        fi
+    fi
+
+    status_line info 'Для подробного локального инвентаря можно выполнить bash install.sh --audit --offline.'
+    cat <<'EOF'
+1. Сделайте снимок ВМ или резервную копию всего сервера и БД, проверьте восстановление и воспроизведите окружение на клоне.
+2. Сверьте версии PHP CLI и сайта, ядра и модулей Битрикса, БД, расширений и кодировку.
+EOF
+    if [[ "$route" == migrate || "$route" == compatibility ]]; then
+        echo '3. На клоне подберите совместимые промежуточные версии ядра, модулей и PHP. Проверьте устаревшие API, пользовательский код и доступность нужных расширений на каждом этапе.'
+        if [ "$route" = compatibility ]; then
+            echo '4. Если совместимость и полный набор пакетов подтверждены, после промежуточного этапа повторите bash install.sh --plan. Если рабочую цепочку подтвердить не удалось, подготовьте перенос на поддерживаемое BitrixVM/BitrixEnv.'
+        else
+            echo '4. Подготовьте перенос на поддерживаемое BitrixVM/BitrixEnv. Проверьте сайт, фоновые задачи, БД и способ возврата перед переключением трафика.'
+        fi
+        return
+    fi
+    cat <<'EOF'
+3. На клоне установите доступные для текущего PHP обновления ядра Битрикса, модулей и сторонних решений из Marketplace. Оцените совместимость пользовательского кода и расширений со следующей веткой PHP.
+   Подготовка к PHP 8 описана в курсе Bitrix https://dev.1c-bitrix.ru/learning/course/?COURSE_ID=48&LESSON_ID=9685
+4. Проверьте штатный Apache/mod_php, подписи, наличие RPM и разрешимость всех зависимостей для выбранной версии и промежуточных шагов. Проверьте репозитории ОС, Bitrix, Remi и прочие источники, нужные вашей конфигурации. Публичные репозитории Remi для EL7 закрыты. При отсутствии проверенного полного набора пакетов выберите перенос на поддерживаемое окружение.
+EOF
+    if [ "$package" = bitrix-env-crm ]; then
+        package_menu='2. Update packages on host'
+        php_menu='6. Update PHP and MySQL'
+    fi
+    status_line info 'Эти действия выполняет администратор на клоне через штатное меню BitrixEnv.'
+    echo '   Войдите на сервер управления пулом как root и запустите bash /root/menu.sh.'
+    echo '   Для отдельного сервера это меню запускается на самом клоне.'
+    if [ "$route" = environment ]; then
+        cat <<EOF
+5. Сначала проверьте маршрут обновления самого BitrixEnv до выпуска 7.5.3–7.5.5. Где это предусмотрено инструкцией для вашего выпуска, используйте 1. Manage servers in the pool → $package_menu → имя нужного хоста → bitrix. Сверьте название пункта в своём меню, уточните состав пакетов и опробуйте задачу на клоне.
+   Для перехода на 7.5.0 действовала отдельная процедура из-за обновления Ansible. Если ваш маршрут проходит через 7.5.0 или требует обновления Ansible, сверьтесь с примечанием поставщика до запуска задачи пула https://dev.1c-bitrix.ru/community/forums/forum32/topic138822/
+6. Дождитесь завершения задачи в Background pool tasks → View running tasks и проверьте результат по журналу в /opt/webdir/temp. После успешного обновления окружения перезагрузите обновлённый узел клона, дождитесь запуска служб, проверьте сайт и выполните bash install.sh --plan.
+   Меню описано в курсе Bitrix https://dev.1c-bitrix.ru/learning/course/?COURSE_ID=37&LESSON_ID=8825
+EOF
+    else
+        if [[ "$version" == 7.5.3 && "$cli" == 8.1.* ]]; then
+            echo '5. Для BitrixEnv 7.5.3 с PHP 8.1 пункт Upgrade PHP может отсутствовать. В 7.5.4 это исправлено. Проверьте на клоне обновление окружения до 7.5.4–7.5.5, затем повторите bash install.sh --plan.'
+            menu_step=6
+        fi
+        case "$cli" in
+            7.4.*) php_target=8.0 ;;
+            8.0.*) php_target=8.1 ;;
+            8.1.*) php_target=8.2 ;;
+        esac
+        if [ -n "$php_target" ]; then
+            printf '%s. После проверки зависимостей выберите только следующий этап PHP %s на клоне.\n' "$menu_step" "$php_target"
+            echo "   1. Manage servers in the pool → $php_menu → имя нужного хоста → Upgrade PHP → PHP $php_target. Сверьте названия пунктов в своём меню."
+        else
+            printf '%s. Для исходного PHP подтвердите на клоне совместимую промежуточную ветку. В меню Upgrade PHP выберите эту ветку и проверьте результат перед следующим переходом.\n' "$menu_step"
+        fi
+        if [ "$version" = 7.5.5 ]; then
+            case "$cli" in
+                7.4.*) echo '   Цепочка на клоне 7.4 → 8.0 → 8.1 → 8.2, с отдельной проверкой сайта после каждого этапа.' ;;
+                8.0.*) echo '   Цепочка на клоне 8.0 → 8.1 → 8.2, с отдельной проверкой сайта после каждого этапа.' ;;
+                8.1.*) echo '   В 7.5.5 предусмотрен переход 8.1 → 8.2.' ;;
+            esac
+        fi
+        printf '%s. ' "$((menu_step + 1))"
+        cat <<'EOF'
+После каждого этапа дождитесь завершения задачи в Background pool tasks → View running tasks. Проверьте результат по журналу в /opt/webdir/temp. При ошибке устраните её перед следующим этапом.
+EOF
+        printf '%s. ' "$((menu_step + 2))"
+        cat <<'EOF'
+Перезагрузите обновлённый узел клона после успешного этапа, дождитесь запуска служб и подтвердите версии PHP CLI, RPM и веб-PHP. Проверьте сайт, админку, формы, интеграции и фоновые задания. Снова проверьте доступные обновления ядра, модулей и решений Маркетплейса для установленного PHP и проверьте сайт после их установки.
+EOF
+        printf '%s. ' "$((menu_step + 3))"
+        cat <<'EOF'
+Сохраните проверенное состояние клона. Выполните bash install.sh --check и --plan для следующего этапа. На PHP 8.2.x мастер проверит возможность установки патча 8.2.35.
+   Примечания к выпускам Bitrix https://dev.1c-bitrix.ru/learning/course/?CHAPTER_ID=011219&COURSE_ID=37
+   Меню описано в курсе Bitrix https://dev.1c-bitrix.ru/learning/course/?COURSE_ID=37&LESSON_ID=8831
+EOF
+    fi
+    echo 'Этот маршрут основан на архивной документации. Доступность пакетов на узле предстоит проверить.'
+    echo 'Архив Remi EL7 https://rpms.remirepo.net/enterprise/7/'
+}
+
+quick_check() {
+    local url='' cli='' route detail rpm_rc=0 web_rc=0 next_action=''
+    if [ "$#" -gt 0 ]; then
+        if [[ "$#" -ne 2 || "$1" != --url || -z "$2" || "$2" == --* ]]; then
+            err 'Использование: bash install.sh --check [--url URL]'
+            return 2
+        fi
+        url="$2"
+        health_url_parts "$url" >/dev/null || return
+    fi
+
+    printf 'BITRIX SERVER MASTER %s — быстрая проверка\n' "$MASTER_VERSION"
+    cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
+    route="$(php_version_route "$cli")"
+    case "$route" in
+        unknown)
+            if [[ "$cli" =~ ^[[:alnum:]_.+~-]+$ ]]; then
+                status_line warning "PHP CLI $cli. Требуется проверка происхождения и совместимости версии."
+            else
+                status_line critical "PHP CLI недоступен или версия не определена. Целевая версия: $TARGET_PHP."
+            fi
+            cli=''
+            next_action='--plan'
+            ;;
+        older)
+            status_line warning "PHP CLI $cli. Для перехода на PHP 8.2 нужен отдельный маршрут."
+            next_action='--plan'
+            ;;
+        newer) status_line info "PHP CLI $cli. Понижение до $TARGET_PHP не предусмотрено." ;;
+        target) target_php_status || next_action='--audit --offline' ;;
+        patch)
+            if ! detail="$(profile_check 2>&1)"; then
+                detail="${detail##*$'\n'}"
+                detail="${detail#ОШИБКА: }"
+                status_line warning "PHP CLI $cli. Автоматическое обновление недоступно. $detail"
+                next_action='--audit --offline'
+            else
+                detail="$(php_rpm_versions_check "$cli" 2>&1)" || rpm_rc=$?
+                if [ "$rpm_rc" -eq 0 ]; then
+                    status_line warning "PHP CLI $cli. На этом профиле можно подготовить обновление до $TARGET_PHP."
+                    next_action='--plan'
+                elif [ "$rpm_rc" -eq 1 ]; then
+                    status_line critical "Автоматическое обновление недоступно. RPM отличаются от PHP CLI $cli. Первое расхождение — $detail."
+                    next_action='--audit --offline'
+                else
+                    detail="${detail##*$'\n'}"
+                    detail="${detail#ОШИБКА: }"
+                    status_line warning "Автоматическое обновление недоступно. RPM не подтверждены. $detail"
+                    next_action='--audit --offline'
+                fi
+            fi
+            ;;
+    esac
+
+    if [ -z "$url" ]; then
+        status_line info 'Веб-PHP не проверялся. Для проверки нужен закрытый URL сайта.'
+    elif [ -z "$cli" ]; then
+        status_line warning 'Сайт: веб-PHP не проверен. Не определена ожидаемая версия PHP.'
+        web_rc=63
+    elif http_check "$url" "$cli" >/dev/null 2>&1; then
+        status_line ok "Сайт: веб-PHP $cli (apache2handler) подтверждён, HTTP 200."
+    else
+        web_rc=$?
+        status_line warning "Сайт: веб-PHP не подтверждён для версии $cli."
+        if [ "$route" != older ]; then next_action='--audit --offline'; fi
+    fi
+
+    show_os_status
+
+    if [ -n "$next_action" ]; then
+        status_line info "Следующий шаг: bash install.sh $next_action"
+    fi
+    return "$web_rc"
+}
+
+show_plan() {
+    local cli route detail='' profile_rc=20
+    printf 'BITRIX SERVER MASTER %s — план обновления\n' "$MASTER_VERSION"
+    cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
+    route="$(php_version_route "$cli")"
+    status_line info 'Веб-PHP не проверялся. Для проверки используйте --check --url URL закрытого теста.'
+    if [[ "$cli" =~ ^8\.2\.[0-9]+$ ]]; then
+        if detail="$(profile_check 2>&1)"; then
+            profile_rc=0
+            printf '%s\n' "$detail"
+        else
+            profile_rc=$?
+            detail="${detail##*$'\n'}"
+            status_line warning "${detail#ОШИБКА: }"
+        fi
+    fi
+    case "$route" in
+        target)
+            if [ "$profile_rc" -eq 0 ]; then target_php_status || profile_rc=$?; else target_php_status || true; fi
+            show_os_status
+            return "$profile_rc" ;;
+        newer)
+            status_line info "Понижение PHP $cli до $TARGET_PHP не предусмотрено."
+            show_os_status
+            return "$profile_rc" ;;
+    esac
+    if [ "$route" != patch ]; then
+        show_legacy_php_plan "$cli"
+        return 20
+    fi
+    if [ "$profile_rc" -ne 0 ]; then
+        status_line warning "Подготовка патча $TARGET_PHP доступна только для подтверждённого профиля."
+        if [[ "$detail" == *'httpd -M'* ]]; then
+            status_line info 'Если httpd -M не удалось выполнить из-за прав, повторите проверку с доступом на чтение конфигурации Apache, при необходимости от root.'
+        fi
+        status_line info 'Следующий шаг: bash install.sh --audit --offline'
+        return "$profile_rc"
+    fi
+    if ! php_rpm_versions_check "$cli"; then
+        status_line warning 'Версии основных RPM и PHP CLI не совпадают или не подтверждены.'
+        status_line info 'Следующий шаг: bash install.sh --audit --offline'
+        return 20
+    fi
+    cat <<'EOF'
+1. Проверьте резервную копию или снимок ВМ и доступ к консоли гипервизора.
+2. Подготовьте на отдельной ВМ новые RPM и полный комплект точных старых RPM.
+3. Подпишите манифесты и подготовьте доверенный публичный keyring.
+4. Подготовьте закрытый URL проверки Apache/PHP на самом узле.
+5. Проверьте на клоне установку, функциональность сайта и откат по ID сессии.
+6. Согласуйте окно обслуживания и повторите проверенную процедуру.
+CentOS 7 снята с поддержки. Поддержка PHP 8.2 завершается 31.12.2026.
+EOF
+}
+
+safe_download() {
+    local url="$1" path="$2"
+    need curl || return
+    msg "Скачивание: $url"
+    curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+         --retry 2 --connect-timeout 15 --max-time 600 --output "$path.part" "$url" || return 30
+    [ -s "$path.part" ] || { err 'Скачан пустой файл.'; return 30; }
+    mv -f -- "$path.part" "$path"
+}
+
+# Генерируем маленькое проверенное исправление OpenSSL 1.0.2 через diff.
+make_openssl_patch() {
+    local tarball="$1" dest="$2" temp src orig edited linecount
+    need tar awk diff patch || return
+    temp="$(mktemp -d "$WORK_ROOT/openssl-fix.XXXXXXXX")" || return
+    if ! tar -xJf "$tarball" -C "$temp" "php-$TARGET_PHP/ext/openssl/xp_ssl.c"; then
+        err 'Не удалось извлечь ext/openssl/xp_ssl.c'; rm -rf "$temp"; return 30
+    fi
+    src="$temp/php-$TARGET_PHP/ext/openssl/xp_ssl.c"
+    orig="$temp/orig.c"; edited="$temp/edited.c"
+    cp "$src" "$orig"
+    linecount="$(grep -c '^#include <openssl/dh.h>' "$orig")"
+    [ "$linecount" = 1 ] || { err 'В исходнике нет ожидаемой точки вставки патча.'; rm -rf "$temp"; return 30; }
+    awk '
+    { print }
+    /^#include <openssl\/dh.h>$/ {
+      print ""
+      print "/* OpenSSL 1.0.2 compatibility (EL7) */"
+      print "#if PHP_OPENSSL_API_VERSION < 0x10100"
+      print "static const unsigned char *ASN1_STRING_get0_data(const ASN1_STRING *asn1)"
+      print "{"
+      print "    return M_ASN1_STRING_data(asn1);"
+      print "}"
+      print "#endif"
+    }' "$orig" > "$edited"
+    diff -u --label a/ext/openssl/xp_ssl.c --label b/ext/openssl/xp_ssl.c "$orig" "$edited" > "$dest"
+    if ! patch --dry-run --fuzz=0 -d "$temp/php-$TARGET_PHP" -p1 < "$dest" >/dev/null 2>&1; then
+        err 'Ошибка проверки патча OpenSSL.'; rm -rf "$temp"; return 30
+    fi
+    rm -rf "$temp"
+    msg 'Патч совместимости OpenSSL подготовлен и проверен.'
+}
+
+prepare_spec() {
+    local root="$1" spec="$1/SPECS/php82.spec" new="$1/SPECS/php82.modified.spec"
+    [ -f "$spec" ] || { err "Не найден php82.spec в $root/SPECS."; return 31; }
+    cp "$spec" "$spec.original"
+    if ! grep -q '^Patch302:' "$spec" || ! grep -q '^%patch -P302' "$spec"; then
+        err 'Структура spec изменилась: не удалось найти Patch302.'; return 31
+    fi
+    # Специфично для исходного Remi php82.spec на 8.2.35.
+    awk '
+    /^Release:[[:space:]]*1%\{\?dist\}/ { sub(/1%\{\?dist\}/, "1%{?dist}.1") }
+    /^BuildRequires:[[:space:]]*pkgconfig\(icu-(i18n|io|uc)\)[[:space:]]*>= 74/ { sub(/>= 74/, ">= 73") }
+    /^Patch302:/ { print; print "Patch900: php-8.2.35-openssl102-asn1.patch"; next }
+    /^%patch -P302/ { print; print "%patch -P900 -p1 -b .openssl102"; next }
+    {print}
+    ' "$spec" > "$new" || return
+    if ! grep -q '^Patch900:' "$new" || ! grep -q '^%patch -P900' "$new" || ! grep -q '>= 73' "$new"; then
+        err 'Не удалось корректно модифицировать spec.'; return 31
+    fi
+    mv -f "$new" "$spec"
+    msg "Спецификация адаптирована: $spec"
+}
+
+source_prepare() {
+    local dir="$1" src="$2" top keyring sig status fingerprint
+    need rpm2cpio cpio sha256sum rpm rpmbuild gpg tar patch diff readlink || return
+    mkdir -p -- "$dir" || return
+    dir="$(readlink -f -- "$dir")" || return 30
+    top="$dir/rpmbuild"
+    mkdir -p -m 0700 "$top/SOURCES" "$top/SPECS" "$top/BUILD" "$top/BUILDROOT" "$top/RPMS" "$top/SRPMS" || return
+    if [ -n "$src" ]; then
+        [ -f "$src" ] && [ ! -L "$src" ] || { err 'Указанный SRPM не существует или является символической ссылкой.'; return 30; }
+        cp -- "$src" "$dir/remi.src.rpm" || return
+    else
+        safe_download "$SRC_RPM_URL" "$dir/remi.src.rpm" || return
+    fi
+    # Проверяем весь SRPM, включая spec, патчи и ключи, до открытия его payload.
+    if ! (cd -- "$dir" && printf '%s  remi.src.rpm\n' "$SRC_RPM_SHA256" | sha256sum -c -); then
+        err 'SHA-256 SRPM не совпал с закреплённым значением Remi. Распаковка запрещена.'; return 30
+    fi
+    # Не разрешаем распаковку файлов SRPM за пределы изолированного каталога.
+    local entries="$dir/source-entries.txt"
+    if ! (rpm2cpio "$dir/remi.src.rpm" | cpio -it --quiet) > "$entries" 2>"$dir/source-list-errors.log"; then
+        err 'Не удалось прочитать перечень файлов SRPM.'; return 30
+    fi
+    if ! awk '
+      { p=$0; sub(/^\.\//, "", p); if (p !~ /^[[:alnum:]_.+-]+$/ || p == ".." || p == ".") bad=1 }
+      END { exit bad }
+    ' "$entries"; then
+        err 'В SRPM обнаружены недопустимые пути; распаковка отменена.'; return 30
+    fi
+    # Отдельно проверяем SHA-256 и подпись исходного архива PHP.
+    if ! (cd "$top/SOURCES" && rpm2cpio "$dir/remi.src.rpm" | cpio -idm --quiet) ; then
+        err 'Не удалось извлечь содержимое SRPM.'; return 30
+    fi
+    [ -f "$top/SOURCES/php82.spec" ] || { err 'Не найден php82.spec в SRPM.'; return 30; }
+    cp "$top/SOURCES/php82.spec" "$top/SPECS/php82.spec" || return
+    [ -f "$top/SOURCES/php-$TARGET_PHP.tar.xz" ] || { err 'В SRPM отсутствует исходник нужной версии.'; return 30; }
+    printf '%s  %s\n' "$TARGET_PHP_SHA" "$top/SOURCES/php-$TARGET_PHP.tar.xz" | sha256sum -c - || {
+        err 'Контрольная сумма исходников PHP не совпала.'; return 30;
+    }
+    sig="$top/SOURCES/php-$TARGET_PHP.tar.xz.asc"
+    keyring="$top/SOURCES/php-keyring.gpg"
+    [ -f "$sig" ] && [ -f "$keyring" ] || { err 'Не найдены подпись PHP и keyring.'; return 30; }
+    mkdir -m 0700 "$dir/gnupg" || return
+    # GnuPG EL7 может пропустить отдельные ключи из общего PHP keyring.
+    # Решающее условие — проверенная подпись с закреплённым отпечатком ниже.
+    gpg --homedir "$dir/gnupg" --batch --quiet --import "$keyring" > "$dir/source-keyring-import.log" 2>&1 ||
+        warn "GPG завершил импорт с замечаниями. См. $dir/source-keyring-import.log"
+    status="$(gpg --homedir "$dir/gnupg" --batch --status-fd 1 --verify "$sig" "$top/SOURCES/php-$TARGET_PHP.tar.xz" 2>&1)" || {
+        err 'GPG-подпись исходников PHP не подтверждена.'; return 30;
+    }
+    printf '%s\n' "$status" | grep -q 'GOODSIG' || { err 'GPG не подтвердил подпись.'; return 30; }
+    fingerprint="$(printf '%s\n' "$status" | awk '/^\[GNUPG:\] VALIDSIG / {print $3; exit}')"
+    [ "$fingerprint" = 'E60913E4DF209907D8E30D96659A97C9CF2A795A' ] || {
+        err "Неожиданный ключ подписи PHP: $fingerprint"; return 30;
+    }
+    msg 'SHA-256 и GPG-подпись исходников PHP подтверждены.'
+    make_openssl_patch "$top/SOURCES/php-$TARGET_PHP.tar.xz" "$top/SOURCES/php-8.2.35-openssl102-asn1.patch" || return
+    prepare_spec "$top" || return
+    if ! rpmbuild -bp --nodeps --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$dir/prep.log" 2>&1; then
+        err "Ошибка подготовки исходников. См. $dir/prep.log"; tail -n 25 "$dir/prep.log"; return 31
+    fi
+    msg 'Проверка подготовки исходников RPM (%prep) прошла.'
+    printf '%s\n' "$top" > "$dir/topdir"
+}
+
+build_rpms() {
+    local from_srpm="$1" allow_builder="$2" top missing=0 work
+    require_root || return
+    profile_check || return
+    if [ "${PHP_CURRENT:-}" = "$TARGET_PHP" ]; then
+        warn 'PHP уже обновлён, сборка необязательна, но может использоваться для распространения пакетов.'
+    fi
+    if [ "$allow_builder" -ne 1 ]; then
+        warn 'Режим --build предназначен для отдельной копии/строительного сервера.'
+        err 'Укажи --builder после запуска на клоне. На рабочем сервере установка зависимостей сборки запрещена.'
+        return 40
+    fi
+    confirm_phrase 'ВНИМАНИЕ: сборка может устанавливать/обновлять многочисленные системные пакеты. Это допускается только НА КЛОНЕ/СБОРОЧНОЙ ВМ.' 'ЭТО КЛОН' || return
+    session_setup || return
+    check_disk "$WORK_ROOT" 8000 || return
+    need yum rpm rpmbuild rpm2cpio cpio gpg patch diff gcc make sha256sum || {
+        warn 'Отсутствуют инструменты сборки. Их можно установить только на выделенной сборочной ВМ.'
+        confirm_phrase 'Установить инструменты rpm-build, yum-utils, gcc, make, cpio, gnupg2, patch, diffutils, tar, xz на сборочной ВМ?' 'УСТАНОВИТЬ ИНСТРУМЕНТЫ' || return
+        yum install -y rpm-build yum-utils gcc make cpio gnupg2 patch diffutils tar xz || return
+    }
+    work="$WORK_ROOT/build-$SESSION_NAME"
+    mkdir -p -m 0700 "$work" || return
+    msg 'Извлечение источников и проверка подписей...'
+    source_prepare "$work" "$from_srpm" || { mark_state failed_prepare; return 41; }
+    top="$work/rpmbuild"
+    msg 'Проверка зависимостей сборки...'
+    if ! rpmbuild -br --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/buildrequires.log" 2>&1; then
+        # -br в старом rpmbuild может не поддерживаться: используем проверку -bp без --nodeps.
+        if rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/dependencies-check.log" 2>&1; then
+            missing=0
+        else
+            missing=1
+        fi
+    else
+        # -br может создать SRPM; точный список всё равно проверяем.
+        if ! rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/dependencies-check.log" 2>&1; then missing=1; fi
+    fi
+    if [ "$missing" -eq 1 ]; then
+        msg 'Для сборки не хватает зависимостей:'
+        tail -n 45 "$work/dependencies-check.log"
+        need yum-builddep || { err 'Для зависимостей требуется yum-utils и команда yum-builddep.'; return 42; }
+        echo 'Команда yum-builddep может обновить systemd, curl и другие критические пакеты на сборочной ВМ.'
+        confirm_phrase 'Разрешить установку build-зависимостей НА КЛОНЕ после предварительного просмотра транзакции?' 'РАЗРЕШАЮ НА КЛОНЕ' || return
+        yum-builddep --assumeno "$top/SPECS/php82.spec" 2>&1 | tee "$work/builddeps-preview.log" || true
+        confirm_phrase 'Транзакция показана выше. Запустить её НА КЛОНЕ?' 'ВЫПОЛНИТЬ НА КЛОНЕ' || return
+        yum-builddep -y "$top/SPECS/php82.spec" || { err 'Установка build-зависимостей завершилась ошибкой.'; mark_state failed_deps; return 42; }
+    fi
+    msg 'Компиляция и создание RPM. Подробности: build.log'
+    mark_state building
+    if ! rpmbuild -ba --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/build.log" 2>&1; then
+        err 'Компиляция не прошла, последние строки:'; tail -n 35 "$work/build.log"; mark_state failed_build; return 43
+    fi
+    if ! ls "$top/RPMS/x86_64/php-$TARGET_PHP"-*.rpm >/dev/null 2>&1; then
+        err 'После сборки не найден основной RPM-пакет php.'; mark_state failed_build; return 43
+    fi
+    # Оператор подписывает этот манифест отдельно доверенным ключом.
+    (cd "$top/RPMS/x86_64" && sha256sum -- *.rpm > SHA256SUMS) || { err 'Не создан манифест целостности RPM'; return 43; }
+    msg "RPM собраны в $top/RPMS/x86_64"
+    printf '%s\n' "$top/RPMS/x86_64" > "$SESSION_DIR/rpm-dir"
+    mark_state built
+    echo 'Подпиши SHA256SUMS отделённой ASCII-подписью доверенного ключа вне сборочной ВМ.'
+    echo 'Передай весь каталог RPM вместе с SHA256SUMS и SHA256SUMS.asc.'
+}
+
+
+# Полная установленная NEVRA нужна для проверки обновления и точного отката.
+RPM_RECORD_QF='%{NAME}|%{EPOCH}|%{VERSION}|%{RELEASE}|%{ARCH}\n'
+RPM_RECORD_RE='^([[:alnum:]_.+-]+)\|([0-9]+|\(none\))\|([[:alnum:]_.+~^-]+)\|([[:alnum:]_.+~^-]+)\|([[:alnum:]_]+)$'
+
+check_zipstream_library() {
+    local record="$1" files requires path library_found=0
+    if ! [[ "$record" =~ $RPM_RECORD_RE && "$record" == *"|noarch" ]]; then
+        err 'php-zipstream имеет неожиданный формат RPM. Ожидается архитектура noarch.'
+        return 50
+    fi
+    if ! files="$(rpm -ql -- php-zipstream)" || ! requires="$(rpm -qR -- php-zipstream)"; then
+        err 'Не удалось прочитать файлы или зависимости RPM php-zipstream.'
+        return 50
+    fi
+    while IFS= read -r path; do
+        case "$path" in
+          *.so|*.so.*|*.dll|*.ini)
+            err "php-zipstream содержит неожиданный файл $path."; return 50 ;;
+          /usr/share/php/zipstream/zipstream.php) library_found=1 ;;
+          /usr/share/php/zipstream|/usr/share/doc/php-zipstream-*|/usr/share/licenses/php-zipstream*) ;;
+          *)
+            err "php-zipstream содержит неожиданный путь $path."; return 50 ;;
+        esac
+    done <<< "$files"
+    if [ "$library_found" -ne 1 ]; then
+        err 'В php-zipstream не найден ожидаемый файл PHP-библиотеки.'
+        return 50
+    fi
+    # У стандартного EL7 RPM есть зависимость от php-common и служебные зависимости RPM.
+    if ! awk '
+        /^php-common([[:space:]]|$)/ { php = 1; next }
+        /^rpmlib\([^)]*\)([[:space:]]|$)/ { next }
+        { unexpected = 1 }
+        END { exit (!php || unexpected) }
+    ' <<< "$requires"; then
+        err 'php-zipstream имеет неожиданные зависимости. Требуется проверка пакета.'
+        return 50
+    fi
+}
+
+inventory_php_rpms() {
+    local inventory record name
+    local -A core=()
+    inventory="$(rpm -qa --qf "$RPM_RECORD_QF")" || {
+        err 'Не удалось получить полную инвентаризацию RPM.'; return 50;
+    }
+    while IFS= read -r record; do
+        name="${record%%|*}"
+        case " $CORE_RPM_NAMES " in
+            *" $name "*)
+                if ! [[ "$record" =~ $RPM_RECORD_RE && "${BASH_REMATCH[5]}" = x86_64 ]]; then
+                    err "Некорректная запись установленного PHP RPM: $record"; return 50
+                fi
+                if [ -n "${core[$name]:-}" ]; then
+                    err "Установлено несколько RPM с именем $name."; return 50
+                fi
+                core["$name"]="$record"
+                continue ;;
+        esac
+        case "$name" in
+            php-zipstream) check_zipstream_library "$record" || return 50 ;;
+            php-pecl-*|php-pear*|php-composer*|phpMyAdmin*|php-phpunit*) ;;
+            php|php-*|php[0-9][0-9]-php|php[0-9][0-9]-php-*)
+                err "Обнаружен нестандартный PHP RPM ($name). Требуется ручная проверка."; return 50 ;;
+        esac
+    done <<< "$inventory"
+    for name in php php-cli php-common; do
+        [ -n "${core[$name]:-}" ] || { err "Не установлен обязательный RPM $name."; return 50; }
+    done
+    printf '%s\n' "${core[@]}" | sort
+}
+
+verify_rpm_catalog() (
+    local directory="$1" keyring="$2" line name verify grep_rc=0
+    local manifest_pattern='[0-9a-fA-F]{64} [ *](\./)?[a-zA-Z0-9][a-zA-Z0-9_.+-]*\.rpm'
+    local -A names=()
+    need gpgv sha256sum grep head cp mkdir rm stat || return
+    for name in SHA256SUMS SHA256SUMS.asc; do
+        if ! [[ -f "$directory/$name" && ! -L "$directory/$name" ]] ||
+           [ "$(stat -c %s -- "$directory/$name")" -gt 8388608 ]; then
+            err "Некорректный файл подписанного каталога $name."; return 50
+        fi
+    done
+    [[ -f "$keyring" && ! -L "$keyring" ]] || return 50
+    verify="$(mktemp -d "$directory/.verification.XXXXXXXX")" || return 50
+    trap 'rm -rf -- "$verify"' EXIT
+    if ! cp -P -- "$keyring" "$verify/public.gpg" ||
+       ! [[ -f "$verify/public.gpg" && ! -L "$verify/public.gpg" ]] ||
+       ! head -n 1 -- "$directory/SHA256SUMS.asc" | grep -aEx -- $'-----BEGIN PGP SIGNATURE-----\r?' >/dev/null ||
+       ! gpgv --homedir "$verify" --keyring "$verify/public.gpg" "$directory/SHA256SUMS.asc" "$directory/SHA256SUMS"; then
+        err 'Не подтверждена подпись каталога RPM доверенным ключом.'; return 50
+    fi
+    grep -aExv -- "$manifest_pattern" "$directory/SHA256SUMS" >/dev/null || grep_rc=$?
+    if [ "$grep_rc" -ne 1 ]; then
+        err 'Недопустимая строка в SHA256SUMS.'; return 50
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        name="${line:66}"; name="${name#./}"
+        if [ -n "${names[$name]:-}" ]; then
+            err "Повтор имени в SHA256SUMS: $name"; return 50
+        fi
+        names["$name"]=1
+    done < "$directory/SHA256SUMS"
+    [ "${#names[@]}" -gt 0 ] || { err 'Подписанный каталог RPM пуст.'; return 50; }
+)
+
+load_auto_config() {
+    local config="$1" line key value
+    local -A seen=()
+    AUTO_SOURCE='' AUTO_KEYRING='' AUTO_HEALTH_URL=''
+    if ! config="$(trusted_rpm_keyring "$config")" || [ "$(stat -c %s -- "$config")" -gt 16384 ]; then
+        err 'Нужна конфигурация автоматического обновления в защищённом файле root. Выполните настройку через меню.'; return 80
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ -n "$line" && "$line" != \#* ]] || continue
+        if [[ "$line" != *=* ]]; then
+            err 'Конфигурация должна содержать строки SOURCE=, KEYRING= и HEALTH_URL=.'; return 80
+        fi
+        key="${line%%=*}"; value="${line#*=}"
+        if ! [[ "$key" =~ ^(SOURCE|KEYRING|HEALTH_URL)$ ]]; then
+            err "Неизвестное поле конфигурации: $key"; return 80
+        fi
+        if [ -z "$key" ] || [ -n "${seen[$key]:-}" ] || [ -z "$value" ] || [[ "$value" =~ [[:cntrl:]] ]]; then
+            err 'В конфигурации есть повтор, пустое значение или управляющий символ.'; return 80
+        fi
+        case "$key" in
+            SOURCE) AUTO_SOURCE="$value" ;;
+            KEYRING) AUTO_KEYRING="$value" ;;
+            HEALTH_URL) AUTO_HEALTH_URL="$value" ;;
+            *) err "Неизвестное поле конфигурации: $key"; return 80 ;;
+        esac
+        seen["$key"]=1
+    done < "$config"
+    if [[ -z "$AUTO_SOURCE" || "$AUTO_KEYRING" != /* || -z "$AUTO_HEALTH_URL" ]]; then
+        err 'Заполните SOURCE, абсолютный путь KEYRING и HEALTH_URL.'; return 80
+    fi
+    while [[ "$AUTO_SOURCE" == */ && "$AUTO_SOURCE" != / ]]; do AUTO_SOURCE="${AUTO_SOURCE%/}"; done
+    if ! [[ "$AUTO_SOURCE" == /* || "$AUTO_SOURCE" =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?(/[a-zA-Z0-9_./~%+@=-]*)?$ ]]; then
+        err 'SOURCE должен быть абсолютным путём или HTTPS-адресом каталога без учётных данных и параметров.'; return 80
+    fi
+    health_url_parts "$AUTO_HEALTH_URL" >/dev/null || return 80
+}
+
+fetch_auto_asset() {
+    local source="$1" name="$2" destination="$3" path
+    if [[ "$source" == https://* ]]; then
+        safe_download "$source/$name" "$destination" || return 81
+    else
+        path="$source/$name"
+        if ! [[ -f "$path" && ! -L "$path" ]] ||
+           ! cp -P -- "$path" "$destination.part" ||
+           ! [[ -f "$destination.part" && ! -L "$destination.part" && -s "$destination.part" ]] ||
+           ! mv -- "$destination.part" "$destination"; then
+            err "Не удалось получить файл комплекта $name."; return 81
+        fi
+    fi
+}
+
+prepare_auto_catalog() {
+    local source="$1" kind="$2" directory="$3" keyring="$4"
+    mkdir -m 0700 -- "$directory" || return 81
+    fetch_auto_asset "$source" "$kind-SHA256SUMS" "$directory/SHA256SUMS" &&
+    fetch_auto_asset "$source" "$kind-SHA256SUMS.asc" "$directory/SHA256SUMS.asc" &&
+    verify_rpm_catalog "$directory" "$keyring"
+}
+
+run_auto_update() (
+    local config="$1" unattended="$2" work='' record identity name line digest current
+    local -A old_hashes=()
+    require_root || return
+    need rpm php httpd systemctl curl awk sort grep cmp cp chmod stat mktemp || return
+    if ! profile_check; then
+        status_line info 'Следующий шаг — bash install.sh --plan'; return 20
+    fi
+    current="$PHP_CURRENT"
+    load_auto_config "$config" || return
+    if [ "$current" = "$TARGET_PHP" ]; then
+        run_update '' "$AUTO_HEALTH_URL" '' '' "$unattended"; return
+    fi
+    if [[ ! "${current##*.}" =~ ^[0-9]{1,3}$ ]] || [ "${current##*.}" -ge "${TARGET_PHP##*.}" ]; then
+        err "Для PHP $current обновление до $TARGET_PHP не требуется."; return 20
+    fi
+    if [ "$unattended" = 0 ] && [ ! -t 0 ]; then
+        err 'Для подтверждения установки нужен терминал. Для заранее согласованного запуска нужны --unattended и --backup-verified.'; return 12
+    fi
+    need gpgv sha256sum || return
+    AUTO_KEYRING="$(trusted_rpm_keyring "$AUTO_KEYRING")" || {
+        err 'Доверенный keyring недоступен или имеет небезопасные права.'; return 80
+    }
+    ensure_session_dir "$UPDATER_STATE" && ensure_session_dir "$WORK_ROOT" || return
+    check_disk "$WORK_ROOT" 1024 || return
+    work="$(mktemp -d "$WORK_ROOT/auto-prepare.XXXXXXXX")" || return 81
+    trap 'rm -rf -- "$work"' EXIT
+    if ! inventory_php_rpms > "$work/inventory" ||
+       ! awk -F'|' -v version="$current" 'NF != 5 || $3 != version { exit 1 }' "$work/inventory"; then
+        err 'Исходный комплект RPM PHP не согласован с версией CLI.'; return 80
+    fi
+    if ! http_check "$AUTO_HEALTH_URL" "$current"; then
+        err 'Исходный веб-PHP не прошёл проверку. Исправьте маршрут проверки или сайт перед обновлением.'; return 80
+    fi
+    cp -P -- "$AUTO_KEYRING" "$work/public.gpg" && chmod 0600 -- "$work/public.gpg" || return 81
+    msg 'Проверка подписанных каталогов новых и прежних RPM...'
+    prepare_auto_catalog "$AUTO_SOURCE" OLD "$work/old" "$work/public.gpg" &&
+    prepare_auto_catalog "$AUTO_SOURCE" NEW "$work/new" "$work/public.gpg" || return 81
+    while IFS= read -r line || [ -n "$line" ]; do
+        name="${line:66}"; name="${name#./}"
+        old_hashes["$name"]="${line:0:64}"
+    done < "$work/old/SHA256SUMS"
+    while IFS= read -r record; do
+        identity="$(printf '%s\n' "$record" | sha256sum)" || return 81
+        name="${record%%|*}-${identity%% *}.rpm"
+        digest="${old_hashes[$name]:-}"
+        if [ -z "$digest" ]; then
+            err "В подписанном архиве отсутствует точный прежний RPM: $record"; return 81
+        fi
+        fetch_auto_asset "$AUTO_SOURCE" "$name" "$work/old/$name" || return 81
+        if ! (cd -- "$work/old" && printf '%s  %s\n' "$digest" "$name" | sha256sum --status -c -); then
+            err "Контрольная сумма прежнего RPM не совпала: $name"; return 81
+        fi
+    done < "$work/inventory"
+    while IFS= read -r line || [ -n "$line" ]; do
+        name="${line:66}"; name="${name#./}"; digest="${line:0:64}"
+        fetch_auto_asset "$AUTO_SOURCE" "$name" "$work/new/$name" || return 81
+        if ! (cd -- "$work/new" && printf '%s  %s\n' "$digest" "$name" | sha256sum --status -c -); then
+            err "Контрольная сумма нового RPM не совпала: $name"; return 81
+        fi
+    done < "$work/new/SHA256SUMS"
+    select_rpms "$work/old" old "$work/inventory" &&
+    select_rpms "$work/new" new "$work/inventory" || return 81
+    msg 'Комплекты проверены. Переходим к проверкам и установке PHP.'
+    run_update "$work/new" "$AUTO_HEALTH_URL" "$work/old" "$work/public.gpg" "$unattended" "$work/inventory"
+)
+
+auto_update_dispatch() {
+    local config='/etc/bitrix-php-update.conf' unattended=0 backup_verified=0 use_default=1
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --config)
+                if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+                    err 'Укажите путь после --config.'; return 2
+                fi
+                config="$2"; use_default=0; shift 2 ;;
+            --unattended) unattended=1; shift ;;
+            --backup-verified) backup_verified=1; shift ;;
+            *) err "Параметр $1 недопустим для --auto-update."; return 2 ;;
+        esac
+    done
+    if [ "$unattended" != "$backup_verified" ]; then
+        err 'Для обновления без запросов параметры --unattended и --backup-verified нужны вместе.'; return 2
+    fi
+    if [ "$use_default" = 1 ] && [ "$unattended" = 0 ] && [ -t 0 ] &&
+       [ ! -e "$config" ] && [ ! -L "$config" ]; then
+        setup_auto_update || return
+    fi
+    run_auto_update "$config" "$unattended"
+}
+
+# Проверяем подпись и хеши копий в новом закрытом каталоге сессии.
+stage_rpm_bundle() (
+    local source="$1" dest="$2" keyring="$3" name path line digest copied=0
+    local rpm_filename='[a-zA-Z0-9][a-zA-Z0-9_.+-]*\.rpm'
+    local -A listed=()
+    need gpgv sha256sum grep head cp mkdir rm || return
+    while [[ "$source" == */ && "$source" != / ]]; do source="${source%/}"; done
+    if ! [[ -d "$source" && ! -L "$source" && -f "$keyring" && ! -L "$keyring" ]]; then
+        err 'Требуются каталог RPM и доверенный файл ключей без символических ссылок.'; return 50
+    fi
+    [[ "$dest" == /* ]] || dest="$PWD/$dest"
+    umask 077
+    mkdir -m 0700 -- "$dest" || return 50
+    trap '[ "$?" -eq 0 ] || rm -rf -- "$dest"' EXIT
+    for name in SHA256SUMS SHA256SUMS.asc; do
+        path="$source/$name"
+        listed["$name"]=1
+        if [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
+        if ! [[ -f "$path" && ! -L "$path" ]] || ! cp -P -- "$path" "$dest/$name" ||
+            ! [[ -f "$dest/$name" && ! -L "$dest/$name" ]]; then
+            err "В каталоге RPM требуется обычный файл $name."; return 50
+        fi
+    done
+    verify_rpm_catalog "$dest" "$keyring" || return 50
+    while IFS= read -r line || [ -n "$line" ]; do
+        digest="${line:0:64}"
+        name="${line:66}"
+        name="${name#./}"
+        if [ -n "${listed[$name]:-}" ]; then
+            err "Повтор имени в SHA256SUMS: $name"; return 50
+        fi
+        path="$source/$name"
+        listed["$name"]=1
+        if [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
+        if ! [[ -f "$path" && ! -L "$path" ]] || ! cp -P -- "$path" "$dest/$name" ||
+            ! [[ -f "$dest/$name" && ! -L "$dest/$name" ]]; then
+            err "В каталоге RPM требуется обычный файл $name."; return 50
+        fi
+        if ! (cd -- "$dest" && printf '%s  %s\n' "$digest" "$name" | sha256sum --status -c -); then
+            err "Контрольная сумма RPM не совпала: $name"; return 50
+        fi
+        copied=$((copied + 1))
+    done < "$dest/SHA256SUMS"
+    if [ "$copied" -eq 0 ]; then
+        err 'В каталоге нет RPM из подписанного манифеста.'; return 50
+    fi
+    shopt -s nullglob dotglob
+    for path in "$source"/*; do
+        name="${path##*/}"
+        if ! [[ -f "$path" && ! -L "$path" ]] ||
+            ! [[ "$name" = SHA256SUMS || "$name" = SHA256SUMS.asc ||
+                ( "$name" =~ ^$rpm_filename$ && -n "${listed[$name]:-}" ) ]]; then
+            err "Посторонний файл в каталоге RPM: $path"; return 50
+        fi
+    done
+)
+
+# Выбор по снимку, без запросов к текущему состоянию RPM.
+select_rpms() {
+    local rpm_dir="$1" mode="$2" inventory="$3" path record name version release arch source_package
+    local el7_release='(^|\.)el7([._+~^-]|$)'
+    local -A expected=() matches=()
+    local -a names=() selected=()
+    SELECTED_RPMS=()
+    if ! [[ -d "$rpm_dir" && ! -L "$rpm_dir" && -f "$inventory" && ! -L "$inventory" &&
+        ( "$mode" = new || "$mode" = old ) ]]; then
+        err 'Нужны подготовленные RPM, снимок пакетов и режим new или old.'; return 50
+    fi
+    while IFS= read -r record || [ -n "$record" ]; do
+        if ! [[ "$record" =~ $RPM_RECORD_RE && "${BASH_REMATCH[5]}" = x86_64 ]]; then
+            err "Некорректная запись в снимке RPM: $record"; return 50
+        fi
+        name="${BASH_REMATCH[1]}"
+        if ! [[ " $CORE_RPM_NAMES " == *" $name "* ]] || [ -n "${expected[$name]:-}" ]; then
+            err "Недопустимый или повторный пакет в снимке RPM: $name"; return 50
+        fi
+        expected["$name"]="$record"
+        names+=("$name")
+    done < "$inventory"
+    for name in php php-cli php-common; do
+        [ -n "${expected[$name]:-}" ] || { err "В снимке отсутствует обязательный RPM $name."; return 50; }
+    done
+    for path in "$rpm_dir"/*.rpm; do
+        if ! [[ -f "$path" && ! -L "$path" ]]; then
+            err "В подготовленном каталоге требуется обычный RPM: $path"; return 50
+        fi
+        record="$(rpm -qp --nosignature --qf "$RPM_RECORD_QF" -- "$path")" || return 50
+        if ! [[ "$record" =~ $RPM_RECORD_RE ]]; then
+            err "Не удалось прочитать NEVRA пакета: $path"; return 50
+        fi
+        name="${BASH_REMATCH[1]}"
+        version="${BASH_REMATCH[3]}"
+        release="${BASH_REMATCH[4]}"
+        arch="${BASH_REMATCH[5]}"
+        [ -n "${expected[$name]:-}" ] || continue
+        case "$mode" in
+            new) [ "$version" = "$TARGET_PHP" ] || continue ;;
+            old) [ "$record" = "${expected[$name]}" ] || continue ;;
+        esac
+        if ! [[ "$arch" = x86_64 && "$release" =~ $el7_release ]]; then
+            err "Неподдерживаемая архитектура или release: $record"; return 50
+        fi
+        # На RPM 4.11 исходный пакет может также иметь ARCH=x86_64.
+        source_package="$(rpm -qp --nosignature --qf '%{SOURCEPACKAGE}' -- "$path")" || return 50
+        if [ "$source_package" != '(none)' ]; then
+            err "Исходный RPM нельзя использовать как бинарный пакет: $path"; return 50
+        fi
+        rpm -K --nosignature -- "$path" >/dev/null || {
+            err "RPM не прошёл проверку целостности: $path"; return 50;
+        }
+        if [ -n "${matches[$name]:-}" ]; then
+            err "Найдено несколько подходящих RPM для $name."; return 50
+        fi
+        matches["$name"]="$path"
+    done
+    for name in "${names[@]}"; do
+        if [ -z "${matches[$name]:-}" ]; then
+            err "Не найден подходящий RPM для $name ($mode)."; return 50
+        fi
+        selected+=("${matches[$name]}")
+    done
+    SELECTED_RPMS=("${selected[@]}")
+    printf 'Пакеты для %s (%s)\n' "$mode" "${#SELECTED_RPMS[@]}"
+    printf '  %s\n' "${SELECTED_RPMS[@]}"
+}
+
+backup_configs() {
+    local dir="$1" mode="$2" roots=() p
+    local -a php_flags=(-d display_startup_errors=1 -d display_errors=stderr)
+    for p in /etc/php.ini /etc/php.d /etc/httpd/conf /etc/httpd/conf.d /etc/httpd/conf.modules.d /etc/httpd/bx /etc/httpd/bx-scale /etc/nginx; do
+        if [ -e "$p" ] || [ -L "$p" ]; then roots+=("${p#/}"); fi
+    done
+    [ "${#roots[@]}" -gt 0 ] || { err 'Не найдено конфигурационных файлов для сохранения.'; return 60; }
+    if ! tar -C / -czpf "$dir/configuration.tar.gz" -- "${roots[@]}" 2>"$dir/tar-warnings.log"; then
+        rm -f -- "$dir/configuration.tar.gz"
+        return 60
+    fi
+    if [ "$mode" = baseline ]; then
+        if ! php "${php_flags[@]}" -m > "$dir/php-modules-before.txt" 2>"$dir/php-modules-errors-before.txt" ||
+           ! php "${php_flags[@]}" -v > "$dir/php-before.txt" 2>>"$dir/php-modules-errors-before.txt" ||
+           ! grep -Fxq '[PHP Modules]' "$dir/php-modules-before.txt" ||
+           [ -s "$dir/php-modules-errors-before.txt" ]; then
+            err 'Не удалось получить исходный список модулей PHP без ошибок.'
+            cat "$dir/php-modules-errors-before.txt"
+            return 60
+        fi
+        httpd -t > "$dir/httpd-before.txt" 2>&1 || { err 'Apache содержит ошибку ещё до обновления.'; return 60; }
+    fi
+    msg "Архив конфигураций сохранён: $dir/configuration.tar.gz"
+}
+
+# Проверяет синтаксис URL без запроса. Выводит имя узла и порт через пробел.
+health_url_parts() {
+    local url="$1" scheme host port path
+    local pattern="^(https?)://([A-Za-z0-9.-]+)(:([1-9][0-9]{0,4}))?(/[A-Za-z0-9._~/%+!$&'()*+,;=:@-]+)$"
+    local dns_label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    local dns_last='[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    if [[ ! "$url" =~ $pattern ]]; then
+        err 'Укажите HTTP(S)-адрес защищённого веб-теста с путём, без учётных данных, запроса или фрагмента.'
+        return 63
+    fi
+    scheme="${BASH_REMATCH[1]}"
+    host="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[4]}"
+    path="${BASH_REMATCH[5]}"
+    # Числовые псевдонимы и внешние IP могут обходить кеш DNS curl.
+    if [ "$host" != '127.0.0.1' ] && { [ "${#host}" -gt 253 ] || [[ ! "$host" =~ ^($dns_label\.)*$dns_last$ ]]; }; then
+        err 'В адресе веб-теста допустимо DNS-имя или 127.0.0.1.'; return 63
+    fi
+    if [[ "$path" == *%* ]]; then
+        local encoded="$path"
+        while [[ "$encoded" == *%* ]]; do
+            encoded="${encoded#*%}"
+            [[ "$encoded" =~ ^[[:xdigit:]]{2} ]] || { err 'Некорректное кодирование пути веб-теста.'; return 63; }
+            encoded="${encoded:2}"
+        done
+    fi
+    if [ -z "$port" ]; then
+        case "$scheme" in https) port=443;; http) port=80;; esac
+    elif [ "$port" -gt 65535 ]; then
+        err 'Порт веб-теста должен быть от 1 до 65535.'; return 63
+    fi
+    printf '%s %s\n' "$host" "$port"
+}
+
+http_check() (
+    local url="$1" expected="$2" address host port response marker
+    address="$(health_url_parts "$url")" || return
+    [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err 'Не задана ожидаемая версия веб-PHP.'; return 63; }
+    need curl head cmp mktemp || return
+    read -r host port <<< "$address"
+    response="$(mktemp)" || { err 'Не удалось создать файл для проверки HTTP.'; return 63; }
+    trap 'rm -f -- "$response"' EXIT
+    # Запрос идёт на локальный Apache с исходными Host и SNI. Ограничиваем
+    # поток также без Content-Length: старый curl ограничивает только известный размер.
+    if ! curl -q --silent --show-error --globoff --proto '=http,https' \
+              --connect-timeout 5 --max-time 20 --noproxy '*' --resolve "$host:$port:127.0.0.1" \
+              --max-filesize 4096 --write-out '\n%{http_code}\n%{remote_ip}\n%{remote_port}\n' \
+              -- "$url" | head -c 4096 > "$response"; then
+        err 'Не удалось выполнить локальную HTTP-проверку.'; return 63
+    fi
+    marker="BITRIX_MASTER_OK $expected apache2handler"
+    if ! cmp -s "$response" <(printf '%s\n200\n127.0.0.1\n%s\n' "$marker" "$port") &&
+       ! cmp -s "$response" <(printf '%s\n\n200\n127.0.0.1\n%s\n' "$marker" "$port"); then
+        err "Веб-тест должен вернуть HTTP 200 и единственную строку «$marker» с локального порта $port."
+        return 63
+    fi
+    printf 'Веб-PHP %s (apache2handler) подтверждён на %s, HTTP 200.\n' "$expected" "$url"
+)
+
+verify_after() {
+    local dir="$1" url="$2" expected="$3" baseline="${4-}" oldm version rc=0
+    local php_errors="$dir/php-modules-errors-after.txt"
+    local php_modules="$dir/php-modules-after.txt"
+    local -a php_flags=(-d display_startup_errors=1 -d display_errors=stderr)
+    if [ "$#" -lt 4 ] && [ -e "$dir/php-modules-before.txt" ]; then
+        baseline="$dir/php-modules-before.txt"
+    fi
+    [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err 'Не задана ожидаемая версия PHP CLI.'; return 1; }
+    msg 'Контроль: CLI PHP'
+    php "${php_flags[@]}" -v 2>"$php_errors" || rc=1
+    if ! version="$(php "${php_flags[@]}" -r 'echo PHP_VERSION;' 2>>"$php_errors")" ||
+       [ "$version" != "$expected" ]; then
+        err "PHP CLI не совпадает с ожидаемой версией $expected."; rc=1
+    fi
+    msg 'Контроль: модули PHP'
+    if ! php "${php_flags[@]}" -m >"$php_modules" 2>>"$php_errors" ||
+       ! grep -Fxq '[PHP Modules]' "$php_modules"; then
+        err 'Не удалось получить список модулей PHP CLI.'; rc=1
+    fi
+    if [ -s "$php_errors" ]; then
+        err 'При запуске PHP CLI были ошибки:'; cat -- "$php_errors"; rc=1
+    fi
+    if [ -n "$baseline" ]; then
+        if [ ! -f "$baseline" ] || [ ! -r "$baseline" ]; then
+            err "Недоступен исходный список модулей PHP: $baseline"; rc=1
+        else
+            # Пропускаем только служебные заголовки и пустые строки.
+            while IFS= read -r oldm || [ -n "$oldm" ]; do
+                case "$oldm" in ''|'[PHP Modules]'|'[Zend Modules]') continue;; esac
+                if ! grep -Fxiq -- "$oldm" "$php_modules"; then
+                    err "Пропал модуль: $oldm"; rc=1
+                fi
+            done < "$baseline" || rc=1
+        fi
+    fi
+    msg 'Контроль: конфигурация и служба Apache'
+    httpd -t || rc=1
+    systemctl is-active --quiet httpd || { err 'Apache не запущен.'; rc=1; }
+    http_check "$url" "$expected" || rc=1
+    return "$rc"
+}
+
+apache_health_diagnostics() {
+    local dir="$1" log
+    {
+        printf '=== systemctl status httpd ===\n'
+        if command -v systemctl >/dev/null && command -v timeout >/dev/null; then
+            timeout 8s systemctl status httpd --no-pager --full 2>&1 | head -c 16384 || true
+        fi
+        printf '\n=== journalctl -u httpd ===\n'
+        if command -v journalctl >/dev/null && command -v timeout >/dev/null; then
+            timeout 8s journalctl -u httpd -n 60 --no-pager 2>&1 | head -c 32768 || true
+        fi
+        for log in /var/log/httpd/error_log /var/log/httpd/error.log; do
+            if [ -f "$log" ] && [ -r "$log" ]; then
+                printf '\n=== %s ===\n' "$log"
+                tail -c 32768 -- "$log" | tail -n 60 || true
+            fi
+        done
+    } > "$dir/apache-health-failure.log" || return 0
+    msg "Журналы Apache: $dir/apache-health-failure.log"
+}
+
+resolve_rpm_dir() {
+    local p="$1"
+    if [ -n "$p" ]; then printf '%s' "$p"; return; fi
+    if [ -d /root/rpmbuild/RPMS/x86_64 ]; then printf '%s' '/root/rpmbuild/RPMS/x86_64'; return; fi
+    if [ -d "$WORK_ROOT/packages/x86_64" ]; then printf '%s' "$WORK_ROOT/packages/x86_64"; return; fi
+    printf ''
+}
+
+rpm_core_snapshot() {
+    # При восстановлении php/php-cli/php-common могут временно отсутствовать.
+    rpm -qa --qf "$RPM_RECORD_QF" |
+        awk -F'|' -v names="$CORE_RPM_NAMES" 'BEGIN { n = split(names, items, " "); for (i = 1; i <= n; i++) core[items[i]] = 1 } $1 in core' |
+        sort
+}
+
+update_recovery_hint() {
+    err "Для восстановления используйте --rollback --session $SESSION_NAME или проверенный снимок."
+    printf 'Архив конфигураций для ручной проверки: %s/configuration.tar.gz\n' "$SESSION_DIR"
+}
+
+check_external_rpm_obsoletes() {
+    local installed obsoletes package name
+    [ "$#" -gt 0 ] || return 0
+    installed="$(rpm -qa --qf '%{NAME}\n')" || return 1
+    for package in "$@"; do
+        obsoletes="$(rpm -qp --nosignature --qf '[%{OBSOLETENAME}\n]' -- "$package")" || return 1
+        while IFS= read -r name; do
+            if [ -n "$name" ] && [[ " $CORE_RPM_NAMES " != *" $name "* ]] &&
+               grep -Fxq -- "$name" <<< "$installed"; then
+                err "RPM $package может удалить $name, которого нет в плане восстановления."
+                return 1
+            fi
+        done <<< "$obsoletes"
+    done
+}
+
+trusted_rpm_keyring() {
+    local supplied="$1" path parent metadata owner mode
+    [[ "$supplied" == /* && ! -L "$supplied" ]] || return 1
+    path="$(readlink -e -- "$supplied")" || return 1
+    [ -f "$path" ] && [ -s "$path" ] || return 1
+    parent="$path"
+    while :; do
+        metadata="$(stat -c '%u:%a' -- "$parent")" || return 1
+        IFS=: read -r owner mode <<< "$metadata"
+        [[ "$owner" = 0 && "$mode" =~ ^[0-7]{1,4}$ ]] || return 1
+        (( (8#$mode & 022) == 0 )) || return 1
+        [ "$parent" != / ] || break
+        parent="$(dirname -- "$parent")" || return 1
+    done
+    printf '%s\n' "$path"
+}
+
+run_update() {
+    local rpmdir="$1" url="$2" rollback_dir="$3" keyring="$4" unattended="${5:-0}" expected_inventory="${6:-}" current dir file
+    local -a update_rpms rollback_rpms
+    require_root || return
+    need rpm php httpd systemctl curl tar awk sort grep cmp cp chmod sync || return
+    health_url_parts "$url" >/dev/null || return 61
+    session_setup || return
+    dir="$SESSION_DIR"
+    profile_check || { mark_state precheck_failed; return 61; }
+    if [ "$PHP_CURRENT" = "$TARGET_PHP" ]; then
+        if ! inventory_php_rpms > "$dir/rpm-recheck.txt" ||
+           ! awk -F'|' -v version="$TARGET_PHP" 'NF != 5 || $3 != version { exit 1 }' "$dir/rpm-recheck.txt"; then
+            err 'Версия CLI целевая, но установленный набор RPM PHP не согласован.'
+            mark_state precheck_failed
+            return 61
+        fi
+        if ! verify_after "$dir" "$url" "$TARGET_PHP" ''; then
+            mark_state precheck_failed
+            apache_health_diagnostics "$dir"
+            return 61
+        fi
+        mark_state already_current || return
+        msg "PHP $TARGET_PHP уже установлен, CLI и сайт прошли проверку."
+        return 0
+    fi
+    current="$PHP_CURRENT"
+    if [[ ! "${current##*.}" =~ ^[0-9]{1,3}$ ]] || [ "${current##*.}" -ge "${TARGET_PHP##*.}" ]; then
+        err "Исходная версия PHP $current не поддерживает обновление до $TARGET_PHP."
+        mark_state precheck_failed
+        return 61
+    fi
+    if [ -z "$rpmdir" ] || [ -z "$rollback_dir" ] || ! keyring="$(trusted_rpm_keyring "$keyring")"; then
+        err 'Нужны каталоги новых и прежних подписанных RPM. Доверенный keyring укажите абсолютным путём в каталоге root без прав записи для группы и остальных.'
+        mark_state precheck_failed
+        return 61
+    fi
+    check_disk "$UPDATER_STATE" 300 || return 61
+    check_disk /var/lib 300 || return 61
+    inventory_php_rpms > "$dir/rpm-before.txt" || { mark_state precheck_failed; return 61; }
+    if [ -n "$expected_inventory" ] && ! cmp -s "$expected_inventory" "$dir/rpm-before.txt"; then
+        err 'Состав PHP RPM изменился во время подготовки. Повторите --auto-update.'
+        mark_state precheck_failed
+        return 61
+    fi
+    if ! cp --no-dereference -- "$keyring" "$dir/trusted-keyring.gpg" ||
+       [ ! -f "$dir/trusted-keyring.gpg" ] || [ -L "$dir/trusted-keyring.gpg" ] ||
+       ! chmod 0600 -- "$dir/trusted-keyring.gpg" || ! private_session_file "$dir/trusted-keyring.gpg"; then
+        err 'Не удалось сохранить закрытую копию доверенного кольца ключей.'
+        mark_state precheck_failed
+        return 61
+    fi
+    if ! stage_rpm_bundle "$rollback_dir" "$dir/rpm-rollback" "$dir/trusted-keyring.gpg" ||
+       ! select_rpms "$dir/rpm-rollback" old "$dir/rpm-before.txt"; then
+        err 'Нужен полный подписанный набор прежних RPM с точным совпадением NEVRA.'
+        mark_state precheck_failed
+        return 61
+    fi
+    rollback_rpms=("${SELECTED_RPMS[@]}")
+    if ! stage_rpm_bundle "$rpmdir" "$dir/rpm-update" "$dir/trusted-keyring.gpg" ||
+       ! select_rpms "$dir/rpm-update" new "$dir/rpm-before.txt"; then
+        mark_state precheck_failed
+        return 61
+    fi
+    update_rpms=("${SELECTED_RPMS[@]}")
+    for file in "${update_rpms[@]}"; do
+        rpm -qp --nosignature --qf "$RPM_RECORD_QF" -- "$file" || { mark_state precheck_failed; return 61; }
+    done > "$dir/rpm-target.txt.unsorted"
+    sort "$dir/rpm-target.txt.unsorted" > "$dir/rpm-target.txt" || return 61
+    rm -f -- "$dir/rpm-target.txt.unsorted"
+    printf '%s\n' "$current" > "$dir/php-version-before.txt" || return 61
+    printf '%s\n' "$url" > "$dir/url" || return 61
+
+    msg "План: PHP $current -> $TARGET_PHP. Проверяем сайт $url"
+    cat "$dir/rpm-target.txt"
+    if ! check_external_rpm_obsoletes "${update_rpms[@]}" "${rollback_rpms[@]}" ||
+       ! rpm -Uvh --oldpackage --replacepkgs --test "${rollback_rpms[@]}" ||
+       ! rpm -Uvh --test "${update_rpms[@]}"; then
+        err 'Предварительная проверка RPM-транзакции не прошла.'
+        mark_state install_test_failed
+        return 61
+    fi
+    if [ "$unattended" = 1 ]; then
+        msg 'Резервная копия и запуск обновления подтверждены параметрами --backup-verified и --unattended.'
+    else
+        confirm_phrase 'Подтвердите существование актуального, проверенного снимка ВМ или полной резервной копии сервера.' 'СНИМОК ПРОВЕРЕН' || return
+        confirm_phrase 'Установить указанные пакеты и перезапустить Apache? Сайт может быть временно недоступен.' 'ОБНОВИТЬ PHP' || return
+    fi
+    if ! backup_configs "$dir" baseline; then
+        mark_state backup_failed
+        return 62
+    fi
+    if ! systemctl is-active --quiet httpd || ! http_check "$url" "$current"; then
+        err 'Сайт или служба Apache не прошли проверку перед установкой.'
+        mark_state precheck_failed
+        return 62
+    fi
+    if ! inventory_php_rpms > "$dir/rpm-recheck.txt" ||
+       ! cmp -s "$dir/rpm-before.txt" "$dir/rpm-recheck.txt"; then
+        err 'Состав или версии RPM PHP изменились после предварительной проверки.'
+        mark_state precheck_failed
+        return 62
+    fi
+    if ! check_external_rpm_obsoletes "${update_rpms[@]}" "${rollback_rpms[@]}" ||
+       ! rpm -Uvh --test "${update_rpms[@]}"; then
+        mark_state install_test_failed
+        return 62
+    fi
+    mark_state installing && sync || return 62
+    if ! rpm -Uvh "${update_rpms[@]}"; then
+        mark_state installation_failed
+        err 'RPM-транзакция завершилась ошибкой.'
+        update_recovery_hint
+        return 62
+    fi
+    mark_state installed || { update_recovery_hint; return 62; }
+    if ! rpm_core_snapshot > "$dir/rpm-after.txt" ||
+       ! cmp -s "$dir/rpm-target.txt" "$dir/rpm-after.txt"; then
+        mark_state verify_failed
+        err 'Установленные RPM не совпадают с согласованным набором.'
+        update_recovery_hint
+        return 64
+    fi
+    if ! httpd -t; then
+        mark_state apache_config_failed
+        err 'Проверка конфигурации Apache после установки завершилась ошибкой.'
+        apache_health_diagnostics "$dir"
+        update_recovery_hint
+        return 63
+    fi
+    msg 'Перезапуск Apache для загрузки обновлённого mod_php...'
+    if ! systemctl restart httpd; then
+        mark_state restart_failed
+        apache_health_diagnostics "$dir"
+        update_recovery_hint
+        return 63
+    fi
+    mark_state verifying || { update_recovery_hint; return 64; }
+    if ! verify_after "$dir" "$url" "$TARGET_PHP" "$dir/php-modules-before.txt"; then
+        mark_state verify_failed
+        apache_health_diagnostics "$dir"
+        update_recovery_hint
+        return 64
+    fi
+    mark_state completed || return
+    msg "PHP $TARGET_PHP установлен. Apache и сайт прошли проверки."
+    printf 'Сессия обновления: %s\nАрхив конфигураций: %s/configuration.tar.gz\n' "$SESSION_NAME" "$dir"
+    echo 'Проверьте админку Битрикса и ключевые функции сайта вручную.'
+}
+
+plan_rpm_rollback() {
+    # Допустимы пропуск пакета и по одной точной записи из обоих наборов.
+    awk -F'|' '
+        FILENAME == ARGV[1] {
+            if ($1 in old) { invalid = 1; exit 1 }
+            names[++n] = $1
+            old[$1] = $0
+            next
+        }
+        FILENAME == ARGV[2] {
+            if (!($1 in old) || ($1 in target)) { invalid = 1; exit 1 }
+            target[$1] = $0
+            next
+        }
+        {
+            if (!($1 in old) || seen[$0]++ || ($0 != old[$1] && $0 != target[$1])) {
+                print "Непредусмотренная запись RPM: " $0 > "/dev/stderr"
+                invalid = 1
+                exit 1
+            }
+            count[$1]++
+        }
+        END {
+            if (invalid) exit 1
+            for (i = 1; i <= n; i++) {
+                name = names[i]
+                if (!(name in target)) exit 1
+                if (count[name] == 2) print "replace"
+                else if (seen[old[name]]) print "keep"
+                else print "restore"
+            }
+        }
+    ' "$1" "$2" "$3"
+}
+
+# A receipt on the original session survives interrupted recovery processes.
+record_rollback_rpm_state() {
+    local source="$1" state="$2" tmp
+    tmp="$(mktemp "$source/.rollback-rpm-state.XXXXXXXX")" || return 1
+    if ! { printf '%s\n' "$state" > "$tmp" && mv -f -- "$tmp" "$source/rollback-rpm-state"; }; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+rollback_rpm_uncertain() {
+    local source="$1" id="$2" original_state="$3" receipt="$1/rollback-rpm-state" attempt state
+    if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+        if ! private_session_file "$receipt"; then
+            err 'Небезопасная запись состояния восстановления RPM.'
+            return 2
+        fi
+        case "$(cat -- "$receipt")" in
+            pending) return 0 ;;
+            complete) return 1 ;;
+            *) err 'Неизвестное состояние восстановления RPM.'; return 2 ;;
+        esac
+    fi
+    case "$original_state" in installing|installation_failed) return 0 ;; esac
+    # Older releases did not write a receipt. An earlier incomplete RPM stage
+    # requires one conservative repair even if another old attempt later succeeded.
+    for attempt in "$UPDATER_STATE"/sessions/*; do
+        private_session_dir "$attempt" || continue
+        private_session_file "$attempt/rollback-of" || continue
+        [ "$(cat -- "$attempt/rollback-of")" = "$id" ] || continue
+        if ! private_session_file "$attempt/state"; then
+            err 'В истории отката нет пригодного состояния сессии.'
+            return 2
+        fi
+        state="$(cat -- "$attempt/state")" || return 2
+        case "$state" in
+            rolling_back|rollback_failed) return 0 ;;
+            rollback_verify_failed)
+                if ! private_session_file "$attempt/rpm-after.txt" ||
+                   ! cmp -s "$source/rpm-before.txt" "$attempt/rpm-after.txt"; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+run_rollback() {
+    local id="$1" url="$2" unattended="${3:-0}" source dir old_php original_url state file action i=0 uncertainty_rc=0
+    local -a rollback_rpms=() rollback_flags=(--oldpackage)
+    require_root || return
+    [[ "$id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || { err 'Укажите идентификатор сессии обновления через --session.'; return 71; }
+    need rpm httpd systemctl curl tar awk sort grep cmp sync || return
+    session_setup || return
+    dir="$SESSION_DIR"
+    source="$UPDATER_STATE/sessions/$id"
+    printf '%s\n' "$id" > "$dir/rollback-of" || return 71
+    platform_check || { mark_state rollback_precheck_failed; return 71; }
+
+    if ! private_session_dir "$source" || ! private_session_dir "$source/rpm-rollback"; then
+        err "Защищённая сессия обновления $id не найдена."
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    for file in state rpm-before.txt rpm-target.txt php-version-before.txt php-modules-before.txt url configuration.tar.gz trusted-keyring.gpg; do
+        if ! private_session_file "$source/$file" || [ ! -s "$source/$file" ]; then
+            err "В сессии $id нет пригодного файла восстановления: $file"
+            mark_state rollback_precheck_failed
+            return 71
+        fi
+    done
+    state="$(cat "$source/state")" || return 71
+    case "$state" in
+        installing|installation_failed|installed|apache_config_failed|restart_failed|verifying|verify_failed|completed) ;;
+        *) err "Состояние «$state» не допускает отката RPM."; mark_state rollback_precheck_failed; return 71 ;;
+    esac
+    old_php="$(cat "$source/php-version-before.txt")" || return 71
+    original_url="$(cat "$source/url")" || return 71
+    url="${url:-$original_url}"
+    if [[ ! "$old_php" =~ ^8\.2\.[0-9]+$ ]] || ! health_url_parts "$url" >/dev/null; then
+        err 'В сессии не указана корректная версия PHP или указан недопустимый URL.'
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    printf '%s\n' "$url" > "$dir/url" || return 71
+    if ! rpm_core_snapshot > "$dir/rpm-before.txt" ||
+       ! plan_rpm_rollback "$source/rpm-before.txt" "$source/rpm-target.txt" "$dir/rpm-before.txt" > "$dir/rpm-rollback-plan.txt"; then
+        err 'Состав RPM не соответствует этому обновлению. Проверьте состояние сервера перед восстановлением.'
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    if ! stage_rpm_bundle "$source/rpm-rollback" "$dir/rpm-rollback" "$source/trusted-keyring.gpg" ||
+       ! select_rpms "$dir/rpm-rollback" old "$source/rpm-before.txt"; then
+        err 'Подписанный набор старых RPM из сессии не прошёл повторную проверку.'
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    rollback_rpm_uncertain "$source" "$id" "$state" || uncertainty_rc=$?
+    if [ "$uncertainty_rc" -gt 1 ]; then
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    if [ "$uncertainty_rc" -eq 0 ]; then
+        # Interrupted install/recovery may leave old headers with uncertain files or scriptlets.
+        rollback_rpms=("${SELECTED_RPMS[@]}")
+        rollback_flags=(--oldpackage --replacepkgs)
+        msg 'Предыдущая RPM-транзакция не подтверждена. Восстанавливаем весь прежний набор RPM.'
+    else
+        while IFS= read -r action; do
+            if [ "$action" != keep ]; then
+                rollback_rpms+=("${SELECTED_RPMS[$i]}")
+            fi
+            if [ "$action" = replace ]; then
+                rollback_flags=(--oldpackage --replacepkgs)
+            fi
+            i=$((i + 1))
+        done < "$dir/rpm-rollback-plan.txt"
+    fi
+
+    msg "Восстановление сессии $id до PHP $old_php. Проверяем сайт $url"
+    printf 'Исходный архив конфигураций: %s/configuration.tar.gz\n' "$source"
+    if [ "$unattended" = 1 ]; then
+        msg 'Откат указанной сессии подтверждён параметром --unattended.'
+    else
+        confirm_phrase 'Восстановить прежние пакеты PHP и перезапустить Apache? Архив конфигураций предназначен для ручного восстановления.' 'ОТКАТИТЬ PHP' || return
+    fi
+    backup_configs "$dir" archive-only || warn 'Текущие конфигурации не удалось сохранить. Исходный архив остаётся доступен.'
+    if ! rpm_core_snapshot > "$dir/rpm-recheck.txt" ||
+       ! cmp -s "$dir/rpm-before.txt" "$dir/rpm-recheck.txt"; then
+        err 'Состав RPM изменился после предварительной проверки. Повторите откат.'
+        mark_state rollback_precheck_failed
+        return 71
+    fi
+    if [ "${#rollback_rpms[@]}" -gt 0 ] && ! rpm -Uvh "${rollback_flags[@]}" --test "${rollback_rpms[@]}"; then
+        err 'Предварительная проверка транзакции отката не прошла.'
+        mark_state rollback_test_failed
+        return 71
+    fi
+    if ! check_external_rpm_obsoletes "${rollback_rpms[@]}"; then
+        mark_state rollback_test_failed
+        return 71
+    fi
+    if ! record_rollback_rpm_state "$source" pending || ! mark_state rolling_back || ! sync; then
+        err 'Не удалось записать состояние перед транзакцией отката.'
+        return 72
+    fi
+    if [ "${#rollback_rpms[@]}" -gt 0 ]; then
+        if ! rpm -Uvh "${rollback_flags[@]}" "${rollback_rpms[@]}"; then
+            err "Ошибка транзакции отката. После диагностики повторите --rollback --session $id."
+            mark_state rollback_failed
+            return 72
+        fi
+    else
+        msg 'Исходный набор RPM уже установлен. Проверяем возможность перезапуска Apache.'
+    fi
+    if ! rpm_core_snapshot > "$dir/rpm-after.txt" ||
+       ! cmp -s "$source/rpm-before.txt" "$dir/rpm-after.txt"; then
+        err 'Состав RPM после отката не совпадает с исходным набором.'
+        mark_state rollback_verify_failed
+        return 72
+    fi
+    if ! record_rollback_rpm_state "$source" complete || ! sync; then
+        err 'RPM восстановлены, но подтверждение этапа не сохранено. Повторите откат по исходной сессии.'
+        mark_state rollback_verify_failed
+        return 72
+    fi
+    if ! httpd -t; then
+        err "Конфигурация Apache требует исправления. Сравните с архивом сессии $id и повторите откат."
+        mark_state rollback_apache_config_failed
+        apache_health_diagnostics "$dir"
+        return 72
+    fi
+    if ! systemctl restart httpd; then
+        err 'Не удалось перезапустить Apache после восстановления RPM.'
+        mark_state rollback_restart_failed
+        apache_health_diagnostics "$dir"
+        return 72
+    fi
+    if ! verify_after "$dir" "$url" "$old_php" "$source/php-modules-before.txt"; then
+        err 'После восстановления RPM проверка PHP, Apache или сайта не пройдена.'
+        mark_state rollback_verify_failed
+        apache_health_diagnostics "$dir"
+        return 72
+    fi
+    mark_state rollback_completed || return
+    msg "Набор RPM из сессии $id восстановлен. PHP $old_php, Apache и сайт прошли проверки."
+}
+
+# Без привилегий показывает последнюю сессию и её состояние.
+show_status() {
+    local last
+    if [ -d "$UPDATER_STATE" ] && [ ! -x "$UPDATER_STATE" ]; then
+        err 'Для просмотра закрытых сессий запустите --status от root.'
+        return 10
+    fi
+    if [ ! -d "$UPDATER_STATE/sessions" ]; then
+        echo 'Сессии обновления пока не обнаружены.'; return 0
+    fi
+    last="$(ls -1dt "$UPDATER_STATE/sessions"/* 2>/dev/null | head -1)"
+    if [ -z "$last" ]; then echo 'Сессии не найдены.'; return 0; fi
+    echo "Последняя сессия: $last"
+    echo -n 'Состояние: '; cat "$last/state" 2>/dev/null || echo 'неизвестно'
+    if [ -r "$last/rollback-of" ]; then
+        printf 'Исходная сессия обновления: '
+        cat -- "$last/rollback-of"
+    fi
+    echo 'Информация о сессии хранится в каталоге с правами root.'
+}
+
+update_help() {
+    cat <<'EOF'
+BITRIX SERVER MASTER 1.0.0-rc8 — диагностика и пилотное обновление PHP
+
+Проверка и отчёт
+  bash install.sh --check
+  bash install.sh --check --url https://site.ru/_php_health.php
+  bash install.sh --audit
+  bash install.sh --audit --offline --report ./audit-full.json
+  bash install.sh --audit --json
+
+--check проверяет целевую версию PHP без Python и доступа к интернету.
+С --url он проверяет настроенный локальный маршрут веб-PHP.
+--audit собирает данные, сверяет патч PHP с PHP.net и сохраняет JSON.
+--plan показывает цепочку перехода на PHP 8.2 для обнаруженного BitrixEnv.
+Переходы между ветками администратор запускает через меню /root/menu.sh.
+На подходящем PHP 8.2.x он показывает план установки патча до 8.2.35.
+Цвета используются в терминале. NO_COLOR=1 отключает цвета.
+
+Подробные команды
+  bash install.sh --diagnose --full --offline
+  bash install.sh --diagnose --json --report
+  bash install.sh --compare OLD.json NEW.json
+  bash install.sh --plan
+
+Сборка на отдельном клоне ВМ
+  bash install.sh --build --builder
+  bash install.sh --build --builder --srpm /path/php-8.2.35-1.remi.src.rpm
+
+Подготовка выпуска на доверенной машине подписи
+  bash install.sh --prepare-release --new-rpm-dir /path/NEW_RPMS --old-rpm-dir /path/OLD_RPMS \
+       --signer FULL_RSA_FINGERPRINT --output /path/NEW_RELEASE
+
+Автоматическая загрузка и установка из выпуска проекта
+  bash install.sh --setup-update
+  bash install.sh --auto-update
+  bash install.sh --auto-update --unattended --backup-verified
+  bash install.sh --auto-update --config /root/client-update.conf
+Первый интерактивный запуск предложит настройку закрытой проверки сайта.
+
+Установка из готовых подписанных комплектов RPM
+  bash install.sh --update --rpm-dir /path/NEW_RPMS --rollback-dir /path/OLD_RPMS \
+       --rpm-keyring /root/rpm-signing.gpg --url https://site.ru/_php_health.php
+
+В каждом каталоге нужны SHA256SUMS и SHA256SUMS.asc. URL должен вернуть HTTP 200
+и строку BITRIX_MASTER_OK <версия PHP> apache2handler. Подготовка описана в README.
+Для запуска без запросов добавьте --unattended --backup-verified только после
+проверки актуального снимка ВМ или полной резервной копии сервера.
+
+Откат из сохранённых RPM конкретной сессии обновления
+  bash install.sh --rollback --session YYYYMMDDTHHMMSSZ-PID
+  bash install.sh --status
+
+Добавьте --unattended, чтобы подтвердить откат указанной сессии без запроса.
+
+Прочее
+  bash install.sh --bootstrap-python
+  bash install.sh --version
+
+Профиль установки — CentOS 7 x86_64, Apache prefork + mod_php,
+пакетный PHP 8.2.x. Целевая версия — PHP 8.2.35. Первый прогон — на клоне.
+EOF
+}
+
+# Prepare release assets on a trusted build/signing machine.
+prepare_release() (
+    local new_dir="$1" old_dir="$2" signer="$3" output="$4"
+    local parent base work='' lock='' tool verify_tool key_info key_fpr key_algorithm
+    local kind input source original staged record name ver release arch target digest file
+    local source_package count
+    local -A names=() old_records=()
+    need rpm sha256sum awk sort cmp cp mv mkdir mktemp rm rmdir dirname readlink || return
+    tool="$(command -v gpg || command -v gpg2)" || { err 'Нужен GnuPG на машине подписи.'; return 50; }
+    verify_tool="$(command -v gpgv || command -v gpgv2)" || { err 'Нужен gpgv на машине подписи.'; return 50; }
+    if ! [[ "$signer" =~ ^[[:xdigit:]]{40}$ ]]; then
+        err 'Укажите полный 40-символьный отпечаток основного RSA-ключа подписи.'
+        return 2
+    fi
+    signer="${signer^^}"
+    if ! key_info="$("$tool" --with-colons --fingerprint --list-secret-keys "$signer" 2>/dev/null)"; then
+        err 'Закрытый ключ подписи не найден в текущем GnuPG.'
+        return 50
+    fi
+    key_fpr="$(awk -F: '$1=="sec" { primary=1; next } primary && $1=="fpr" { print $10; exit }' <<< "$key_info")"
+    key_algorithm="$(awk -F: '$1=="sec" { print $4; exit }' <<< "$key_info")"
+    if [[ "$key_fpr" != "$signer" || "$key_algorithm" != 1 ]]; then
+        err 'Нужен точный отпечаток основного RSA-ключа. Его закрытая часть остаётся на машине подписи.'
+        return 50
+    fi
+    if ! [[ -d "$new_dir" && ! -L "$new_dir" && -d "$old_dir" && ! -L "$old_dir" ]]; then
+        err 'Укажите обычные каталоги доверенных новых и исходных RPM.'
+        return 50
+    fi
+    new_dir="$(readlink -f -- "$new_dir")" && old_dir="$(readlink -f -- "$old_dir")" || return 50
+    output="${output%/}"
+    base="${output##*/}"
+    if ! [[ "$base" =~ ^[[:alnum:]_][[:alnum:]_.+-]*$ ]]; then
+        err 'Укажите имя нового каталога выпуска.'
+        return 2
+    fi
+    parent="$(dirname -- "$output")"
+    parent="$(readlink -f -- "$parent")" || return 50
+    [ -d "$parent" ] || { err 'Родительский каталог выпуска должен существовать.'; return 50; }
+    output="$parent/$base"
+    if [[ "$output" = "$new_dir" || "$output" = "$old_dir" || "$output" = "$new_dir/"* || "$output" = "$old_dir/"* ]]; then
+        err 'Каталог выпуска должен находиться вне исходных каталогов RPM.'
+        return 50
+    fi
+    if [ -e "$output" ] || [ -L "$output" ]; then
+        err 'Каталог выпуска уже существует. Укажите новое имя.'
+        return 50
+    fi
+    lock="$parent/.$base.publish-lock"
+    mkdir -m 0700 -- "$lock" || { err 'Подготовка этого выпуска уже выполняется или остался её каталог блокировки.'; return 50; }
+    trap '[ -z "$work" ] || rm -rf -- "$work"; rmdir -- "$lock"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    work="$(mktemp -d "$parent/.$base.XXXXXXXX")" || return 50
+    umask 077
+    shopt -s nullglob dotglob
+    for kind in NEW OLD; do
+        input="$new_dir"
+        [ "$kind" = NEW ] || input="$old_dir"
+        count=0
+        : > "$work/$kind-SHA256SUMS" || return 50
+        for source in "$input"/*; do
+            original="${source##*/}"
+            case "$original" in SHA256SUMS|SHA256SUMS.asc) continue ;; esac
+            if ! [[ -f "$source" && ! -L "$source" && "$original" =~ ^[[:alnum:]][[:alnum:]_.+-]*\.rpm$ ]]; then
+                err "В исходном каталоге найден посторонний файл или ссылка — $source"
+                return 50
+            fi
+            staged="$work/.rpm-input"
+            rm -f -- "$staged" || return 50
+            cp -P -- "$source" "$staged" || return 50
+            [ -f "$staged" ] && [ ! -L "$staged" ] || return 50
+            record="$(rpm -qp --nosignature --qf "$RPM_RECORD_QF" -- "$staged")" || return 50
+            if ! [[ "$record" =~ $RPM_RECORD_RE ]]; then
+                err "Не удалось прочитать точные метаданные RPM — $source"
+                return 50
+            fi
+            name="${BASH_REMATCH[1]}"
+            ver="${BASH_REMATCH[3]}"
+            release="${BASH_REMATCH[4]}"
+            arch="${BASH_REMATCH[5]}"
+            if ! [[ " $CORE_RPM_NAMES " == *" $name "* && "$arch" = x86_64 &&
+                    "$ver" =~ ^8\.2\.[0-9]+$ && "$release" =~ (^|\.)el7([._+~^-]|$) ]]; then
+                err "Неподходящий пакет для выпуска EL7 PHP 8.2 — $record"
+                return 50
+            fi
+            source_package="$(rpm -qp --nosignature --qf '%{SOURCEPACKAGE}' -- "$staged")" || return 50
+            if [ "$source_package" != '(none)' ] || ! rpm -K --nosignature -- "$staged" >/dev/null; then
+                err "Нужен целый бинарный RPM — $source"
+                return 50
+            fi
+            if [ "$kind" = NEW ]; then
+                if [ "$ver" != "$TARGET_PHP" ] || [ -n "${names[$name]:-}" ]; then
+                    err "Новый комплект должен содержать по одному RPM $TARGET_PHP для каждого имени — $name"
+                    return 50
+                fi
+                target="$original"
+                names["$name"]=1
+            else
+                digest="$(printf '%s\n' "$record" | sha256sum)"
+                target="$name-${digest%% *}.rpm"
+                if [ -n "${old_records[$record]:-}" ]; then
+                    if ! cmp -s "$staged" "$work/$target"; then
+                        err "Одинаковая NEVRA имеет разное содержимое — $record"
+                        return 50
+                    fi
+                    continue
+                fi
+                old_records["$record"]=1
+            fi
+            if [ -e "$work/$target" ]; then
+                err "Совпали имена файлов выпуска — $target"
+                return 50
+            fi
+            mv -- "$staged" "$work/$target" || return 50
+            (cd -- "$work" && sha256sum -- "$target") >> "$work/$kind-SHA256SUMS" || return 50
+            count=$((count + 1))
+        done
+        [ "$count" -gt 0 ] || { err "Комплект $kind пуст."; return 50; }
+        sort -o "$work/$kind-SHA256SUMS" "$work/$kind-SHA256SUMS" || return 50
+    done
+    rm -f -- "$work/.rpm-input" || return 50
+    for name in php php-cli php-common; do
+        [ -n "${names[$name]:-}" ] || { err "В новом комплекте отсутствует $name."; return 50; }
+    done
+    msg "Подписываем подготовленные каталоги ключом $signer."
+    msg 'Подпись подтверждает ваше доверие происхождению входных RPM.'
+    for kind in NEW OLD; do
+        "$tool" --armor --digest-algo SHA256 --local-user "$signer!" \
+            --detach-sign --output "$work/$kind-SHA256SUMS.asc" "$work/$kind-SHA256SUMS" || return 50
+    done
+    "$tool" --export "$signer" > "$work/release-keyring.gpg" || return 50
+    [ -s "$work/release-keyring.gpg" ] || return 50
+    mkdir -m 0700 -- "$work/.verify" || return 50
+    for kind in NEW OLD; do
+        "$verify_tool" --homedir "$work/.verify" --keyring "$work/release-keyring.gpg" \
+            "$work/$kind-SHA256SUMS.asc" "$work/$kind-SHA256SUMS" || return 50
+    done
+    rm -rf -- "$work/.verify" || return 50
+    mv -Tn -- "$work" "$output" || return 50
+    if [ -d "$work" ]; then
+        err 'Каталог назначения появился во время подготовки. Выпуск сохранён не был.'
+        return 50
+    fi
+    work=''
+    msg "Выпуск подготовлен — $output"
+    printf 'Публичный ключ подписи — %s\n' "$signer"
+)
+
+prepare_release_dispatch() {
+    local new_dir='' old_dir='' signer='' output='' option
+    while [ "$#" -gt 0 ]; do
+        option="$1"
+        if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+            err "У параметра $option нет значения."
+            return 2
+        fi
+        case "$option" in
+            --new-rpm-dir) new_dir="$2" ;;
+            --old-rpm-dir) old_dir="$2" ;;
+            --signer) signer="$2" ;;
+            --output) output="$2" ;;
+            *) err "Параметр $option недопустим для --prepare-release."; return 2 ;;
+        esac
+        shift 2
+    done
+    if [[ -z "$new_dir" || -z "$old_dir" || -z "$signer" || -z "$output" ]]; then
+        err 'Укажите --new-rpm-dir, --old-rpm-dir, --signer и --output.'
+        return 2
+    fi
+    prepare_release "$new_dir" "$old_dir" "$signer" "$output"
+}
+
+
+updater_dispatch() {
+    local mode="$1" rpmdir='' olddir='' keyring='' srpm='' url='' session='' builder=0
+    local unattended=0 backup_verified=0
+    shift
+    while [ "$#" -gt 0 ]; do
+        case "$mode:$1" in
+          --build:--builder)
+            builder=1
+            shift
+            continue ;;
+          --update:--unattended|--rollback:--unattended)
+            unattended=1
+            shift ;;
+          --update:--backup-verified)
+            backup_verified=1
+            shift ;;
+          --update:--build-on-host)
+            err 'Сборка отделена от установки. Используйте --build --builder на клоне и подпишите комплект RPM.'
+            return 2 ;;
+          --rollback:--rpm-dir)
+            err 'Откат привязан к записанной сессии. Используйте --rollback --session ID.'
+            return 2 ;;
+          --build:--srpm|--update:--rpm-dir|--update:--rollback-dir|--update:--rpm-keyring|--update:--url|--rollback:--session|--rollback:--url)
+            if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+                err "У параметра $1 нет значения."
+                return 2
+            fi
+            case "$1" in
+              --rpm-dir) rpmdir="$2" ;;
+              --rollback-dir) olddir="$2" ;;
+              --rpm-keyring) keyring="$2" ;;
+              --srpm) srpm="$2" ;;
+              --url) url="$2" ;;
+              --session) session="$2" ;;
+            esac
+            shift 2 ;;
+          *)
+            err "Параметр $1 недопустим для $mode."
+            return 2 ;;
+        esac
+    done
+    case "$mode" in
+       --plan) show_plan ;;
+       --build) build_rpms "$srpm" "$builder" ;;
+       --update)
+           if [ "$unattended" != "$backup_verified" ]; then
+               err 'Для обновления без запросов параметры --unattended и --backup-verified нужны вместе.'
+               return 2
+           fi
+           run_update "$(resolve_rpm_dir "$rpmdir")" "$url" "$olddir" "$keyring" "$unattended" ;;
+       --rollback)
+           if [ -z "$session" ]; then
+               err 'Укажите --session ID исходного обновления.'
+               return 2
+           fi
+           run_rollback "$session" "$url" "$unattended" ;;
+       --status) show_status ;;
+    esac
+}
+
+# Подменю используют те же команды и проверки, что и запуск с флагами.
+menu_checks() {
+    local choice site
+    while :; do
+        echo
+        status_line info 'Проверки и диагностика'
+        echo ' 1. Быстрый чек PHP (по умолчанию)'
+        echo ' 2. Что делать дальше — план обновления'
+        echo ' 3. Полный аудит с отчётом без сети'
+        echo ' 4. Полный аудит с проверкой PHP.net через интернет'
+        echo ' 5. Проверить PHP сайта по закрытому URL'
+        echo ' 6. Подробная диагностика на экране без сети'
+        echo ' 7. Подготовить отдельный Python для полного аудита'
+        echo ' 0. Назад'
+        printf '\n Выберите действие [1]: '
+        IFS= read -r choice || return 1
+        case "$choice" in
+          1|'') bash "$SELF" --check ;;
+          2) bash "$SELF" --plan ;;
+          3) bash "$SELF" --audit --offline ;;
+          4) bash "$SELF" --audit ;;
+          5)
+             printf 'Закрытый URL проверки Apache/PHP (Enter — отмена): '
+             IFS= read -r site || return 1
+             if [ -z "$site" ]; then
+                 echo 'Проверка сайта отменена.'
+             else
+                 bash "$SELF" --check --url "$site"
+             fi ;;
+          6) bash "$SELF" --diagnose --full --offline ;;
+          7) bash "$SELF" --bootstrap-python ;;
+          0) return 0 ;;
+          *) echo 'Неизвестный пункт меню.' ;;
+        esac
+    done
+}
+
+menu_install_rpms() {
+    local rpm_path old_path keyring site
+    echo 'Установка из заранее подготовленных подписанных комплектов.'
+    echo 'В любом поле Enter отменяет установку.'
+    printf 'Каталог новых RPM: '
+    IFS= read -r rpm_path || return 1
+    if [ -z "$rpm_path" ]; then echo 'Установка отменена.'; return 0; fi
+    printf 'Каталог точных старых RPM для отката: '
+    IFS= read -r old_path || return 1
+    if [ -z "$old_path" ]; then echo 'Установка отменена.'; return 0; fi
+    printf 'Абсолютный путь к доверенному публичному keyring: '
+    IFS= read -r keyring || return 1
+    if [ -z "$keyring" ]; then echo 'Установка отменена.'; return 0; fi
+    printf 'Закрытый URL проверки Apache/PHP: '
+    IFS= read -r site || return 1
+    if [ -z "$site" ]; then echo 'Установка отменена.'; return 0; fi
+    bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" --url "$site"
+    return 0
+}
+
+menu_prepare_release() {
+    local new_path old_path signer output_path
+    echo 'Подготовка и подпись выпуска на доверенной сборочной машине.'
+    echo 'В любом поле Enter отменяет подготовку.'
+    printf 'Каталог новых RPM: '
+    IFS= read -r new_path || return 1
+    if [ -z "$new_path" ]; then echo 'Подготовка выпуска отменена.'; return 0; fi
+    printf 'Каталог точных старых RPM для отката: '
+    IFS= read -r old_path || return 1
+    if [ -z "$old_path" ]; then echo 'Подготовка выпуска отменена.'; return 0; fi
+    printf 'Полный отпечаток ключа подписи: '
+    IFS= read -r signer || return 1
+    if [ -z "$signer" ]; then echo 'Подготовка выпуска отменена.'; return 0; fi
+    printf 'Каталог для подготовленного выпуска: '
+    IFS= read -r output_path || return 1
+    if [ -z "$output_path" ]; then echo 'Подготовка выпуска отменена.'; return 0; fi
+    bash "$SELF" --prepare-release --new-rpm-dir "$new_path" --old-rpm-dir "$old_path" --signer "$signer" --output "$output_path"
+    return 0
+}
+
+menu_update() {
+    local choice
+    while :; do
+        echo
+        status_line info 'Подготовка и обновление PHP'
+        echo ' 1. Посмотреть план для этого сервера (по умолчанию)'
+        echo ' 2. Подготовить и обновить из настроенного доверенного выпуска'
+        echo ' 3. Настроить автоматическое обновление — один раз на клиенте'
+        echo ' 4. Собрать RPM на отдельной сборочной ВМ'
+        echo ' 5. Установить подписанные RPM вручную — расширенный режим'
+        echo ' 6. Подписать выпуск на доверенной сборочной машине'
+        echo ' 0. Назад'
+        printf '\n Выберите действие [1]: '
+        IFS= read -r choice || return 1
+        case "$choice" in
+          1|'') bash "$SELF" --plan ;;
+          2) bash "$SELF" --auto-update ;;
+          3) bash "$SELF" --setup-update ;;
+          4) bash "$SELF" --build --builder ;;
+          5) menu_install_rpms || return 1 ;;
+          6) menu_prepare_release || return 1 ;;
+          0) return 0 ;;
+          *) echo 'Неизвестный пункт меню.' ;;
+        esac
+    done
+}
+
+menu_recovery() {
+    local choice session
+    while :; do
+        echo
+        status_line info 'Откат и состояние операции'
+        echo ' 1. Состояние последней операции (по умолчанию)'
+        echo ' 2. Откатить обновление по ID исходной сессии'
+        echo ' 0. Назад'
+        printf '\n Выберите действие [1]: '
+        IFS= read -r choice || return 1
+        case "$choice" in
+          1|'') bash "$SELF" --status ;;
+          2)
+             printf 'ID исходной сессии обновления (Enter — отмена): '
+             IFS= read -r session || return 1
+             if [ -z "$session" ]; then
+                 echo 'Откат отменён.'
+             else
+                 bash "$SELF" --rollback --session "$session"
+             fi ;;
+          0) return 0 ;;
+          *) echo 'Неизвестный пункт меню.' ;;
+        esac
+    done
+}
+
+full_menu() {
+    local choice
+    while :; do
+        echo
+        echo '=================================================================='
+        echo " BITRIX SERVER MASTER $MASTER_VERSION"
+        echo ' Диагностика и обновление PHP на старом BitrixEnv'
+        echo '=================================================================='
+        echo ' 1. Проверки и диагностика (по умолчанию)'
+        echo ' 2. Подготовка и обновление PHP'
+        echo ' 3. Откат и состояние операции'
+        echo ' 4. Справка по командам'
+        echo ' 0. Выход'
+        printf '\n Выберите раздел [1]: '
+        IFS= read -r choice || return 0
+        case "$choice" in
+          1|'') menu_checks || return 0 ;;
+          2) menu_update || return 0 ;;
+          3) menu_recovery || return 0 ;;
+          4) bash "$SELF" --help ;;
+          0) return 0 ;;
+          *) echo 'Неизвестный пункт меню.' ;;
+        esac
+    done
+}
+
+setup_auto_update() (
+    local config='/etc/bitrix-php-update.conf' keydir='/etc/bitrix-php-update' temp='' config_temp='' health='' cli='' keyfile=''
+    local source='https://github.com/vitikevich-landau/bitrix-php82-updater/releases/download/php-8.2.35-el7-r1'
+    local key_url='https://raw.githubusercontent.com/vitikevich-landau/bitrix-php82-updater/main/release-keyring.gpg'
+    local expected_key='7f07067817dfb211bb503e8f5a8e7c0a4b73d2e26154e9b07091548d1dcfb91c'
+    require_root || return
+    [ "$#" -eq 0 ] || { err 'Использование: bash install.sh --setup-update'; return 2; }
+    [ -t 0 ] || { err 'Первичная настройка требует терминала. Запустите bash install.sh --setup-update.'; return 12; }
+    profile_check || return
+    need curl sha256sum mktemp mv chmod gpgv dirname || return
+    if [ -e "$config" ] || [ -L "$config" ]; then
+        load_auto_config "$config" || return
+        health="$AUTO_HEALTH_URL"
+    fi
+    echo 'Настройка подключает общий выпуск проекта и его закреплённый ключ.'
+    printf 'Источник комплектов — %s\n' "$source"
+    echo 'Нужен закрытый URL проверки веб-PHP на этом сервере. Подготовка описана в README.'
+    printf 'URL проверки%s: ' "${health:+ [$health]}"
+    local entered=''
+    IFS= read -r entered || return 12
+    health="${entered:-$health}"
+    health_url_parts "$health" >/dev/null || return
+    cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || return 61
+    http_check "$health" "$cli" || { err 'Сначала настройте закрытый веб-тест и повторите настройку.'; return 61; }
+    printf 'Проверка сайта пройдена для PHP %s.\n' "$cli"
+    confirm_phrase 'Сохранить источник пакетов, публичный ключ проверки и URL сайта?' 'СОХРАНИТЬ НАСТРОЙКИ' || return
+    if [ -e "$keydir" ] || [ -L "$keydir" ]; then
+        private_session_dir "$keydir" || { err 'Каталог /etc/bitrix-php-update должен принадлежать root с правами 0700.'; return 61; }
+    else
+        mkdir -m 0700 -- "$keydir" || return 61
+    fi
+    temp="$(mktemp -d "$keydir/.setup.XXXXXXXX")" || return 61
+    trap 'rm -rf -- "$temp"; [ -z "$config_temp" ] || rm -f -- "$config_temp"' EXIT
+    safe_download "$key_url" "$temp/release-keyring.gpg" || return
+    printf '%s  %s\n' "$expected_key" "$temp/release-keyring.gpg" | sha256sum --status -c - || {
+        err 'Публичный ключ не совпадает с закреплённой контрольной суммой этого выпуска.'; return 61;
+    }
+    chmod 0600 -- "$temp/release-keyring.gpg" || return
+    keyfile="$keydir/release-$expected_key.gpg"
+    if [ -e "$keyfile" ] || [ -L "$keyfile" ]; then
+        private_session_file "$keyfile" || { err 'Небезопасный файл публичного ключа.'; return 61; }
+        printf '%s  %s\n' "$expected_key" "$keyfile" | sha256sum --status -c - || {
+            err 'Сохранённый ключ выпуска повреждён. Проверьте каталог публичных ключей.'; return 61;
+        }
+    else
+        mv -- "$temp/release-keyring.gpg" "$keyfile" || return
+    fi
+    config_temp="$(mktemp "$(dirname -- "$config")/.bitrix-php-update.XXXXXXXX")" || return
+    printf 'SOURCE=%s\nKEYRING=%s\nHEALTH_URL=%s\n' "$source" "$keyfile" "$health" > "$config_temp" || return
+    chmod 0600 -- "$config_temp" || return
+    mv -f -- "$config_temp" "$config" || return
+    msg 'Настройки сохранены. Для обновления запустите bash install.sh --auto-update.'
+)
+
+# Мутирующие операции: отдельный обработчик Bash, без зависимости от Python.
+if [ "$#" -eq 0 ] && [ -t 0 ]; then full_menu; exit $?; fi
+case "${1:-}" in
+  --setup-update)
+      shift
+      setup_auto_update "$@"
+      exit $?
+      ;;
+  --auto-update)
+      shift
+      auto_update_dispatch "$@"
+      exit $?
+      ;;
+  --prepare-release)
+      shift
+      prepare_release_dispatch "$@"
+      exit $?
+      ;;
+  --check)
+      shift
+      quick_check "$@"
+      exit $?
+      ;;
+  --plan|--build|--update|--rollback|--status)
+      action="$1"; shift
+      updater_dispatch "$action" "$@"
+      exit $?
+      ;;
+esac
+
+# Обработка режима изолированной установки Python происходит только по явному запросу.
+if [ "${1:-}" = '--help' ] || [ "${1:-}" = '-h' ]; then help_ru; exit 0; fi
+if [ "${1:-}" = '--version' ]; then printf 'Bitrix Server Master %s\n' "$MASTER_VERSION"; exit 0; fi
+if [ "${1:-}" = '--bootstrap-python' ]; then
+    shift
+    python_archive=''
+    if [ "${1:-}" = '--python-archive' ]; then
+        if [ -z "${2:-}" ]; then echo 'Укажите путь к архиву.' >&2; exit 2; fi
+        python_archive="$2"
+        shift 2
+    fi
+    if [ "$#" -ne 0 ]; then echo 'Лишние аргументы режима --bootstrap-python.' >&2; exit 2; fi
+    bootstrap_python "$python_archive"
+    exit $?
+fi
+
+if [ "${1:-}" = '--audit' ]; then
+    shift
+    audit_options=("$@")
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --offline|--json) ;;
+          --report)
+              if [ "$#" -gt 1 ] && [[ "$2" != -* ]]; then
+                  if [ -z "$2" ]; then err 'Укажите непустой путь отчёта.'; exit 2; fi
+                  shift
+              fi
+              ;;
+          --report=) err 'Укажите непустой путь отчёта.'; exit 2 ;;
+          --report=*) ;;
+          *) err "Параметр $1 недопустим для --audit. См. --help."; exit 2 ;;
+        esac
+        shift
+    done
+    set -- --diagnose --full --check-updates --report "${audit_options[@]}"
+fi
+
+py="$(python_path)"
+if [ -z "$py" ]; then
+    fallback_diagnose "$@"
+    exit $?
+fi
+
+# Встроенная программа исполняется из stdin: --diagnose не создаёт .py-файлов на диске.
+sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGET_PHP="$TARGET_PHP" "$py" -B - "$@"
+exit $?
+
+# Всё после этой строки — встроенный код Python, внутри heredoc для bash -n.
+: <<'__PYTHON_PAYLOAD_END__'
+__PYTHON_PAYLOAD_START__
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Bitrix Server Master — read-only diagnostics engine (stdlib only)."""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+VERSION = '1.0.0-rc8'
+PHP_EOL = {'5.6': '2018-12-31', '7.0': '2019-01-10', '7.1': '2019-12-01',
+           '7.2': '2020-11-30', '7.3': '2021-12-06', '7.4': '2022-11-28',
+           '8.0': '2023-11-26', '8.1': '2025-12-31', '8.2': '2026-12-31',
+           '8.3': '2027-12-31', '8.4': '2028-12-31', '8.5': '2029-12-31'}
+OS_EOL = {'centos:7': '2024-06-30', 'centos:8': '2021-12-31',
+          'rhel:7': '2024-06-30', 'almalinux:8': '2029-05-31',
+          'almalinux:9': '2032-05-31', 'rocky:8': '2029-05-31',
+          'rocky:9': '2032-05-31'}
+RISK_PRIORITIES = {'critical': 0, 'warning': 1, 'info': 2}
+
+
+def run(argv, timeout=6, max_chars=5000, include_stderr=False):
+    try:
+        cp = subprocess.run(argv, capture_output=True, text=True, errors='replace',
+                            timeout=timeout, env={**os.environ, 'LC_ALL': 'C'})
+        output = ((cp.stdout or '') + '\n' + (cp.stderr or '')) if include_stderr else (cp.stdout or cp.stderr or '')
+        return output.strip()[:max_chars], cp.returncode
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return '', 127
+
+
+def read(path, limit=16384):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            return fh.read(limit)
+    except (OSError, UnicodeError):
+        return ''
+
+
+def parse_os_release():
+    pairs = {}
+    for ln in read('/etc/os-release').splitlines():
+        if '=' in ln and not ln.lstrip().startswith('#'):
+            key, value = ln.split('=', 1)
+            pairs[key] = value.strip().strip('"')
+    return pairs
+
+
+def version(text):
+    m = re.search(r'\b(\d+)\.(\d+)\.(\d+)\b', text or '')
+    return m.group(0) if m else None
+
+
+def branch(ver):
+    return '.'.join(ver.split('.')[:2]) if ver else None
+
+
+def lifecycle(kind, key):
+    today = dt.datetime.now(dt.timezone.utc).date()
+    last = (PHP_EOL if kind == 'php' else OS_EOL).get(key)
+    if not last:
+        return {'status': 'unknown', 'deadline': None, 'note': 'Срок поддержки не задан в этой версии справочника'}
+    ended = today > dt.date.fromisoformat(last)
+    return {'status': 'ended' if ended else 'supported', 'deadline': last,
+            'note': 'Основная или расширенная поддержка завершилась' if ended else 'Указанный срок окончания поддержки ещё не наступил'}
+
+
+def iso_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+
+
+def memory():
+    result = {}
+    for line in read('/proc/meminfo').splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1)
+            try:
+                result[k] = int(v.strip().split()[0]) // 1024
+            except (ValueError, IndexError):
+                pass
+    return {k: result.get(k) for k in ('MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree')}
+
+
+def disk(path):
+    try:
+        st = os.statvfs(path)
+        return {'path': path, 'total_gb': round(st.f_blocks * st.f_frsize / (1024**3), 2),
+                'available_gb': round(st.f_bavail * st.f_frsize / (1024**3), 2),
+                'used_pct': round(100 * (st.f_blocks - st.f_bfree) / max(1, st.f_blocks), 1)}
+    except OSError:
+        return None
+
+
+def package_list():
+    if not shutil.which('rpm'):
+        return [], 'RPM отсутствует'
+    raw, rc = run(['rpm', '-qa', '--qf', '%{NAME}|%{VERSION}|%{RELEASE}\n'], timeout=16, max_chars=800000)
+    if rc != 0:
+        return [], 'Не удалось получить список RPM'
+    packages = []
+    for line in raw.splitlines():
+        parts = line.split('|')
+        if len(parts) == 3:
+            packages.append({'name': parts[0], 'version': parts[1], 'release': parts[2]})
+    # Avoid unbounded output: for safety the collector intentionally stores only relevant packages.
+    return packages, None
+
+
+def php_core_rpms(packages, cli_version, package_error):
+    names = ('php', 'php-cli', 'php-common')
+    core = [package for package in packages if package['name'] in names]
+    result = {'status': 'unknown', 'packages': core, 'missing': [], 'mismatches': [], 'duplicates': []}
+    if package_error or not cli_version:
+        result['reason'] = package_error or 'Версия PHP CLI не определена'
+        return result
+    result['missing'] = [name for name in names if not any(p['name'] == name for p in core)]
+    result['mismatches'] = [p for p in core if p['version'] != cli_version]
+    result['duplicates'] = [name for name in names if sum(p['name'] == name for p in core) > 1]
+    result['status'] = ('ambiguous' if result['duplicates'] else
+                        'mismatch' if result['mismatches'] else
+                        'incomplete' if result['missing'] else 'confirmed')
+    return result
+
+
+def get_packages(all_packages, rx):
+    return sorted([p for p in all_packages if re.search(rx, p['name'], re.I)],
+                  key=lambda p: p['name'])
+
+
+def svc(name):
+    if not shutil.which('systemctl'):
+        return 'недоступно'
+    out, rc = run(['systemctl', 'is-active', name], timeout=4)
+    if rc == 0:
+        return 'active'
+    first = out.splitlines()[0].strip() if out else ''
+    return first if first in ('inactive', 'failed', 'activating', 'deactivating', 'unknown') else 'unknown'
+
+
+def web_server():
+    apache_bin = shutil.which('httpd') or shutil.which('apache2')
+    nginx_bin = shutil.which('nginx')
+    apache_ver, _ = run([apache_bin, '-v']) if apache_bin else ('', 127)
+    nginx_ver, _ = run([nginx_bin, '-v']) if nginx_bin else ('', 127)
+    mpm = None
+    phpmod = None
+    modules_error = None
+    if apache_bin:
+        out, rc = run([apache_bin, '-M'], timeout=8)
+        if rc == 0:
+            m = re.search(r'\b(mpm_\w+_module)\b', out)
+            mpm = m.group(1) if m else None
+            phpmod = bool(re.search(r'\bphp\d?_module\b', out))
+        else:
+            modules_error = 'Не удалось прочитать модули Apache (httpd -M)'
+    return {
+        'apache': {'version': version(apache_ver), 'active': svc('httpd') if apache_bin else 'нет',
+                   'mpm': mpm, 'mod_php': phpmod, 'modules_check_error': modules_error},
+        'nginx': {'version': version(nginx_ver), 'active': svc('nginx') if nginx_bin else 'нет'},
+        'php_fpm': {'active': svc('php-fpm'), 'process_count': process_count('php-fpm')},
+        'apache_process_count': (process_count('httpd') or 0) + (process_count('apache2') or 0),
+        'apache_worker_limit': apache_worker_limit(),
+    }
+
+
+def process_count(name):
+    out, rc = run(['ps', '-C', name, '-o', 'pid='], timeout=4)
+    return len(out.splitlines()) if rc == 0 else (0 if rc == 1 else None)
+
+
+def apache_worker_limit():
+    vals = []
+    for path in ['/etc/httpd/bx/conf/prefork.conf', '/etc/httpd/bx-scale/conf/prefork.conf',
+                 '/etc/httpd/conf.modules.d/00-mpm.conf']:
+        data = read(path, 100000)
+        m = re.search(r'^\s*MaxRequestWorkers\s+(\d+)', data, re.M | re.I)
+        if m:
+            vals.append({'file': path, 'value': int(m.group(1))})
+    return vals
+
+
+def php_info():
+    loc = shutil.which('php')
+    if not loc:
+        return {'binary': None, 'version': None, 'modules': [], 'module_errors': [],
+                'web_version': None, 'web_version_confirmed': False}
+    ver_out, ver_rc = run([loc, '-v'], timeout=8, include_stderr=True)
+    mod_out, mod_rc = run([loc, '-m'], timeout=8, include_stderr=True)
+    modules = []
+    if mod_rc == 0:
+        for ln in mod_out.splitlines():
+            txt = ln.strip()
+            if txt and not txt.startswith('[') and not txt.startswith('PHP Warning') and not txt.startswith('PHP Fatal error') and not txt.startswith('Warning:') and not txt.startswith('Module ') and txt != '':
+                modules.append(txt)
+    warnings = re.findall(r'PHP (?:Warning|Fatal error):[^\n]+', '\n'.join((ver_out, mod_out)))
+    banner = re.search(r'^PHP ([0-9]+\.[0-9]+\.[0-9]+)(?=\s|$)', ver_out, re.M)
+    return {'binary': loc, 'version': banner.group(1) if ver_rc == 0 and banner else None,
+            'modules': sorted(set(modules), key=str.lower),
+            'module_errors': warnings[:10], 'web_version': None,
+            'web_version_confirmed': False}
+
+
+def repos():
+    enabled, disabled, invalid = [], [], []
+    if not os.path.isdir('/etc/yum.repos.d'):
+        return {'enabled': [], 'disabled': [], 'invalid_files': []}
+    for path in glob.glob('/etc/yum.repos.d/*.repo')[:200]:
+        data = read(path, 150000)
+        if not data:
+            invalid.append(os.path.basename(path))
+            continue
+        section = None
+        flag = '1'
+        for ln in data.splitlines() + ['[__END__]']:
+            s = ln.strip()
+            if s.startswith('#') or s.startswith(';'):
+                continue
+            if s.startswith('[') and s.endswith(']'):
+                if section and section != '__END__':
+                    (enabled if flag == '1' else disabled).append(section)
+                section = s[1:-1]
+                flag = '1'
+            elif section and re.match(r'^enabled\s*=', s, re.I):
+                flag = s.split('=', 1)[1].strip()
+    return {'enabled': sorted(set(enabled)), 'disabled': sorted(set(disabled)),
+            'invalid_files': sorted(set(invalid))}
+
+
+BITRIX_ENV_RPM_NAMES = ('bitrix-env', 'bitrix-env-crm')
+BITRIX_HOME = Path('/home/bitrix')
+BITRIX_INVENTORY = Path('/etc/ansible/hosts')
+BITRIX_MENU = Path('/root/menu.sh')
+BITRIX_VERSION_FILES = (Path('/etc/bitrix-env/version'), Path('/etc/bitrix-env/version.conf'))
+BITRIX_POOL_GROUPS = frozenset((
+    'bitrix-hosts', 'bitrix-mgmt', 'bitrix-web', 'bitrix-mysql', 'bitrix-push',
+    'bitrix-memcached', 'bitrix-sphinx', 'bitrix-searchd', 'bitrix-transformer',
+))
+AUDIT_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}')
+AUDIT_VERSION = r'[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}'
+PHP_METADATA_TOKENS = re.compile(
+    r"""//[^\n]*|\#[^\n]*|/\*.*?(?:\*/|\Z)|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|<<<|=>|[A-Za-z0-9_$]+|\S""",
+    re.S)
+
+
+@contextmanager
+def audit_parent(path):
+    # Hold each directory open so a concurrently replaced symlink cannot redirect a privileged read.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = path.parts
+    fd = os.open(parts[0], flags)
+    try:
+        for part in parts[1:-1]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd, parts[-1]
+    finally:
+        os.close(fd)
+
+
+def audit_error(error):
+    if isinstance(error, FileNotFoundError):
+        return 'missing'
+    if isinstance(error, PermissionError):
+        return 'permission_denied'
+    return 'unavailable'
+
+
+def audit_file(path, limit):
+    try:
+        with audit_parent(path) as (parent, name):
+            if not stat.S_ISREG(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+                return '', 'unavailable'
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            with os.fdopen(os.open(name, flags, dir_fd=parent), 'rb') as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    return '', 'unavailable'
+                data = fh.read(limit + 1)
+    except OSError as error:
+        return '', audit_error(error)
+    if len(data) > limit:
+        return '', 'limited'
+    return data.decode('utf-8-sig', errors='replace'), 'read'
+
+
+def audit_dirs(path, limit):
+    names, count, status = [], 0, 'read'
+    try:
+        with audit_parent(path) as (parent, name):
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        if count >= limit:
+                            status = 'limited'
+                            break
+                        count += 1
+                        if entry.is_dir(follow_symlinks=False):
+                            if AUDIT_NAME.fullmatch(entry.name):
+                                names.append(entry.name)
+                            else:
+                                status = 'limited'
+                        elif entry.is_symlink():
+                            status = 'limited'
+            finally:
+                os.close(fd)
+    except OSError as error:
+        status = audit_error(error)
+    return sorted(names), count, status
+
+
+def php_file_version(path, core=False):
+    text, status = audit_file(path, 32768)
+    if status != 'read':
+        return None, status
+    php = re.fullmatch(r'\s*<\?(?:php(?=\s))?(.*?)(?:\?>\s*)?', text, re.I | re.S)
+    if not php:
+        return None, 'unknown'
+    tokens = [t for t in PHP_METADATA_TOKENS.findall(php[1])
+              if not t.startswith(('//', '#', '/*'))]
+    if any(t in ('<<<', "'", '"', '?', '<') for t in tokens):
+        return None, 'unknown'
+    versions, depth, module_depth = set(), 0, None
+    for i, token in enumerate(tokens):
+        if core:
+            if (token.lower() != 'define' or tokens[i + 1:i + 4] not in
+                    (['(', '"SM_VERSION"', ','], ['(', "'SM_VERSION'", ',']) or
+                    tokens[i + 5:i + 6] != [')']):
+                continue
+            value = tokens[i + 4]
+        else:
+            if token in ('(', '[', '{'):
+                depth += 1
+                if (token == '[' and tokens[i - 2:i] == ['$arModuleVersion', '='] or
+                        token == '(' and tokens[i - 3:i] == ['$arModuleVersion', '=', 'array']):
+                    module_depth = depth
+            elif token in (')', ']', '}'):
+                if depth == module_depth:
+                    module_depth = None
+                depth -= 1
+            if (depth != module_depth or token not in ('"VERSION"', "'VERSION'") or
+                    tokens[i - 1] not in (',', '(', '[') or tokens[i + 1:i + 2] != ['=>'] or
+                    tokens[i + 3:i + 4] not in ([','], [']'], [')'])):
+                continue
+            value = tokens[i + 2]
+        if re.fullmatch(r"""(["'])(""" + AUDIT_VERSION + r""")\1""", value):
+            versions.add(value[1:-1])
+    if len(versions) == 1:
+        return versions.pop(), 'file_only'
+    return None, 'ambiguous' if versions else 'unknown'
+
+
+def bitrix_rpm_version(package):
+    ver, rel = package.get('version'), package.get('release')
+    if not isinstance(ver, str) or not isinstance(rel, str):
+        return None
+    version_match = re.fullmatch(r'[0-9]{1,6}\.[0-9]{1,6}', ver)
+    release_match = re.fullmatch(r'([0-9]{1,6})\.el(?:7(?:\.centos)?|9)', rel)
+    return version_match[0] + '.' + release_match[1] if version_match and release_match else None
+
+
+def bitrix_environment(packages, pkg_err):
+    packages = sorted((p for p in packages if p['name'] in BITRIX_ENV_RPM_NAMES),
+                      key=lambda p: (p['name'], p['version'], p['release']))
+    result = {'version': None, 'status': 'unknown', 'source': None, 'packages': packages}
+    if packages:
+        result['source'] = 'rpm'
+        if len(packages) != 1:
+            result['status'] = 'ambiguous'
+            return result
+        ver = bitrix_rpm_version(packages[0])
+        if ver and not pkg_err:
+            result.update(version=ver, status='confirmed')
+        return result
+
+    # Historical marker files can identify a version with lower confidence than RPM.
+    evidence = []
+    for path in BITRIX_VERSION_FILES:
+        data, status = audit_file(path, 4096)
+        literal = re.fullmatch(r'\s*(?:VERSION\s*=\s*)?(["\']?)(' + AUDIT_VERSION + r')\1\s*', data)
+        if status == 'read' and literal:
+            evidence.append((str(path), literal[2]))
+    if len({ver for _, ver in evidence}) > 1:
+        result.update(status='ambiguous', source='version_files')
+    elif evidence:
+        result.update(version=evidence[0][1], status='file_only', source=evidence[0][0])
+    return result
+
+
+def bitrix_core(site, allowed_cores):
+    core = site / 'bitrix'
+    try:
+        with audit_parent(core) as (parent, name):
+            mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+            if stat.S_ISLNK(mode):
+                # A standard link may share a known site's bitrix directory. Reopen that exact
+                # path without following any links, including chains or a changed target.
+                target = os.path.normpath(str(site / os.readlink(name, dir_fd=parent)))
+                if target not in allowed_cores:
+                    return core, {'version': None, 'status': 'unavailable', 'source': None}
+                core = Path(target)
+    except OSError as error:
+        return core, {'version': None, 'status': audit_error(error), 'source': None}
+
+    candidates = (
+        (core / 'modules/main/classes/general/version.php', True),
+        (core / 'modules/main/install/version.php', False),
+    )
+    status = 'missing'
+    for path, is_core in candidates:
+        ver, state = php_file_version(path, core=is_core)
+        if ver or state == 'ambiguous':
+            return core, {'version': ver, 'status': state, 'source': str(path)}
+        if status == 'missing':
+            status = state
+    return core, {'version': None, 'status': status, 'source': None}
+
+
+def bitrix_modules(site, core, budget):
+    items, examined, statuses = [], 0, {}
+    for location, path in (('bitrix/modules', core / 'modules'), ('local/modules', site / 'local/modules')):
+        dirs, count, state = audit_dirs(path, min(160, budget - examined))
+        examined += count
+        for name in dirs:
+            ver, result = php_file_version(path / name / 'install/version.php')
+            if ver:
+                items.append({'name': name, 'location': location, 'version': ver})
+            else:
+                state = 'limited'
+        statuses[location] = state
+    states = set(statuses.values())
+    if states == {'missing'}:
+        status = 'missing'
+    elif states <= {'missing', 'read'}:
+        status = 'file_only'
+    else:
+        status = 'limited'
+    return {'status': status, 'directories': statuses, 'items': items}, examined
+
+
+def bitrix_sites():
+    default, extras = BITRIX_HOME / 'www', BITRIX_HOME / 'ext_www'
+    roots, coverage = [], {}
+    try:
+        with audit_parent(default) as (parent, name):
+            mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+        coverage['default'] = 'read' if stat.S_ISDIR(mode) else 'unavailable'
+        if coverage['default'] == 'read':
+            roots.append(default)
+    except OSError as error:
+        coverage['default'] = audit_error(error)
+    names, _, coverage['additional'] = audit_dirs(extras, 48)
+    roots.extend(extras / name for name in names)
+
+    allowed = {str(root / 'bitrix') for root in roots}
+    items, budget = [], 512
+    for root in roots:
+        core_path, core = bitrix_core(root, allowed)
+        modules, examined = bitrix_modules(root, core_path, budget)
+        budget -= examined
+        items.append({'root': str(root), 'confidence': 'static_version' if core['version'] else 'filesystem_candidate',
+                      'core': core, 'modules': modules})
+    states = set(coverage.values())
+    status = ('limited' if not states <= {'read', 'missing'} else
+              'file_only' if items else 'missing')
+    return {'status': status, 'coverage': coverage, 'items': items}
+
+
+def bitrix_pool():
+    text, status = audit_file(BITRIX_INVENTORY, 131072)
+    result = {'status': status, 'source': str(BITRIX_INVENTORY), 'hosts': []}
+    if status != 'read':
+        return result
+    group, found, skipped = None, False, False
+    hosts, members = {}, set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(('#', ';')):
+            continue
+        section = re.fullmatch(r'\[([A-Za-z0-9_:-]+)\]\s*(?:[;#].*)?', line)
+        if line.startswith('['):
+            group = section[1] if section and section[1] in BITRIX_POOL_GROUPS else None
+            found = found or group is not None
+            continue
+        if group:
+            host = re.fullmatch(r'([A-Za-z0-9_][A-Za-z0-9_.-]{0,252})(?:\s+(?:[;#].*|\w+=.*))?', line)
+            if not host or (host[1] not in hosts and len(hosts) >= 128):
+                skipped = True
+                continue
+            name = host[1]
+            roles = hosts.setdefault(name, set())
+            if group == 'bitrix-hosts':
+                members.add(name)
+            else:
+                roles.add(group)
+    result['hosts'] = [{'name': name, 'roles': sorted(hosts[name])} for name in sorted(members)]
+    result['status'] = 'limited' if skipped or hosts.keys() - members else 'file_only' if found else 'unknown'
+    return result
+
+
+def bitrix_menu():
+    try:
+        with audit_parent(BITRIX_MENU) as (parent, name):
+            mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+        status = ('present' if mode & 0o111 else 'not_executable') if stat.S_ISREG(mode) else 'unavailable'
+    except OSError as error:
+        status = audit_error(error)
+    return {'path': str(BITRIX_MENU), 'status': status}
+
+
+def bitrix_info(pkgs, full=False, pkg_err=None):
+    bitrix_packages = get_packages(pkgs, r'^(bitrix|bx-)|bitrixenv')
+    markers = {p: os.path.exists(p) for p in ['/home/bitrix/www/bitrix',
+                                               '/etc/httpd/bx', '/etc/nginx/bx',
+                                               '/etc/ansible/']}
+    environment = bitrix_environment(bitrix_packages, pkg_err)
+    sites = bitrix_sites() if full else {'status': 'not_checked', 'items': []}
+    pool = bitrix_pool() if full else {'status': 'not_checked', 'hosts': []}
+    menu = bitrix_menu() if full else {'status': 'not_checked'}
+    return {'detected': (any(markers.values()) or bool(bitrix_packages) or
+                         environment['version'] is not None or
+                         any(site['core']['version'] for site in sites['items']) or
+                         bool(pool['hosts']) or menu['status'] == 'present'),
+            'version': environment['version'], 'markers': markers, 'packages': bitrix_packages[:25],
+            'environment': environment, 'sites': sites, 'pool': pool, 'menu': menu}
+
+
+def db_info(pkgs):
+    names = get_packages(pkgs, r'^(mysql-community-server|Percona-Server-server|MariaDB-server|mariadb-server|mysql-server)$')
+    cli = shutil.which('mysql') or shutil.which('mariadb')
+    v, _ = run([cli, '--version']) if cli else ('', 127)
+    return {'server_packages': names, 'client_version': version(v),
+            'services': {n: svc(n) for n in ('mysqld', 'mariadb')}}
+
+
+def live_php(branch_str, offline):
+    if offline:
+        return {'status': 'skipped', 'reason': 'Включён режим --offline'}
+    if not branch_str or not re.fullmatch(r'\d+\.\d+', branch_str):
+        return {'status': 'unavailable', 'reason': 'Невозможно определить ветку PHP'}
+    url = 'https://www.php.net/releases/index.php?json&version=' + branch_str
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'BitrixServerMaster/' + VERSION})
+        with urllib.request.urlopen(req, timeout=9) as resp:
+            raw = resp.read(20000)
+        j = json.loads(raw.decode('utf-8'))
+        latest = j.get('version') if isinstance(j, dict) else None
+        if not isinstance(latest, str) or not re.fullmatch(r'\d+\.\d+\.\d+', latest) or branch(latest) != branch_str:
+            return {'status': 'unavailable', 'reason': 'PHP.net вернул неподходящие данные'}
+        return {'status': 'ok', 'version': latest, 'source': url}
+    except (OSError, ValueError, KeyError, urllib.error.URLError):
+        return {'status': 'unavailable', 'reason': 'Не удалось подтвердить версию по HTTPS на php.net'}
+
+
+def url_probe(url):
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+    invalid = {'url': None, 'status': 'invalid',
+               'reason': 'Требуется корректный HTTP(S)-адрес без учётных данных'}
+    if re.search(r'[\s\x00-\x1f\x7f\\]', url):
+        return invalid
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname or
+                parsed.username is not None or parsed.password is not None or port == 0 or
+                not re.fullmatch(r'(?:\[[^\[\]]+\]|[^:\[\]@]+)(?::[0-9]+)?', parsed.netloc)):
+            return invalid
+    except ValueError:
+        return invalid
+    try:
+        req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'BitrixServerMaster/' + VERSION})
+        # Redirects may be followed by urllib. This probe is opt-in only.
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            return {'url': url, 'status': 'ok', 'http_code': resp.status, 'note': 'HEAD; версия веб-PHP не подтверждается'}
+    except urllib.error.HTTPError as e:
+        return {'url': url, 'status': 'http_error', 'http_code': e.code, 'note': 'HEAD; сайт ответил ошибкой'}
+    except (OSError, ValueError, urllib.error.URLError):
+        return {'url': url, 'status': 'unavailable', 'reason': 'Нет ответа или ошибка TLS/DNS'}
+
+
+def report_for(args):
+    osrel = parse_os_release()
+    ostype = osrel.get('ID', platform.system().lower()).lower()
+    os_ver = osrel.get('VERSION_ID', '')
+    pkgs, pkg_err = package_list()
+    php = php_info()
+    core_rpms = php_core_rpms(pkgs, php['version'], pkg_err)
+    servers = web_server()
+    ram = memory()
+    disks = [disk('/')]
+    if args.full and os.path.ismount('/home'):
+        disks.append(disk('/home'))
+    php_life = lifecycle('php', branch(php['version']))
+    os_life = lifecycle('os', ostype + ':' + os_ver.split('.')[0])
+    update = live_php(branch(php['version']), args.offline) if args.check_updates else {'status': 'not_checked'}
+    alerts = []
+    def alert(level, code, title, detail):
+        alerts.append({'level': level, 'code': code, 'title': title, 'detail': detail})
+    if os_life['status'] == 'ended':
+        alert('critical', 'OS_EOL', 'Операционная система не поддерживается',
+              'Срок поддержки завершился: ' + str(os_life['deadline']) + '. Рекомендуется план миграции ОС.')
+    elif os_life['status'] == 'unknown':
+        alert('info', 'OS_UNKNOWN', 'Статус поддержки ОС не определён', 'Проверить вручную у производителя дистрибутива.')
+    if php['version'] is None:
+        alert('warning', 'PHP_UNKNOWN', 'PHP CLI не найден или не отвечает', 'Проверить расположение и способы запуска PHP.')
+    elif php_life['status'] == 'ended':
+        alert('critical', 'PHP_EOL', 'Ветка PHP больше не поддерживается',
+              'Срок поддержки: ' + str(php_life['deadline']) + '. Требуется поддерживаемая ветка PHP.')
+    elif php_life['status'] == 'unknown':
+        alert('info', 'PHP_SUPPORT_UNKNOWN', 'Статус поддержки PHP не определён', 'Проверить версию и сроки поддержки вручную.')
+    if update['status'] == 'ok' and php['version']:
+        a = tuple(map(int, php['version'].split('.')))
+        b = tuple(map(int, update['version'].split('.')))
+        if b > a:
+            alert('warning', 'PHP_PATCH', 'Доступно обновление PHP в текущей ветке',
+                  f"Установлено {php['version']}, на php.net опубликовано {update['version']}. Проверить совместимость перед обновлением.")
+        elif b < a:
+            alert('info', 'PHP_AHEAD', 'Локальная версия выше ответа PHP.net', 'Проверить источники и дату публикации пакета.')
+    if args.check_updates and update['status'] not in ('ok', 'skipped'):
+        alert('info', 'UPDATE_UNCERTAIN', 'Не удалось проверить актуальные обновления PHP',
+              'Нельзя делать вывод об актуальности патч-версии без данных из сети.')
+    if php['module_errors']:
+        alert('critical', 'PHP_MODULE_ERRORS', 'Ошибки загрузки модулей PHP CLI',
+              'Проверьте php -m / php -v, найдено: ' + str(len(php['module_errors'])))
+    if servers['apache']['modules_check_error']:
+        alert('info', 'APACHE_CHECK_UNKNOWN', 'Не удалось прочитать модули Apache',
+              'Проверка способа подключения PHP неполная.')
+    if servers['apache']['mod_php'] is True and servers['apache']['active'] == 'active':
+        alert('info', 'MOD_PHP', 'Обнаружен mod_php',
+              'После обновления модулей PHP нужен согласованный полный перезапуск Apache; одного reload может быть недостаточно.')
+    if servers['apache']['mod_php'] is None and servers['php_fpm']['active'] != 'active':
+        alert('info', 'WEB_PHP_UNCONFIRMED', 'Версия PHP через веб-сервер не установлена',
+              'Диагностика не создаёт phpinfo.php и не выполняет PHP-код на сайте.')
+    if disks[0] and disks[0]['available_gb'] < 6:
+        alert('warning', 'LOW_DISK', 'Мало свободного места на корневом разделе',
+              f"Доступно {disks[0]['available_gb']} ГБ. Для сборки может потребоваться больше места.")
+    if ram.get('MemAvailable') is not None and ram['MemAvailable'] < 512:
+        alert('warning', 'LOW_RAM', 'Мало доступной оперативной памяти',
+              'Доступно меньше 512 МиБ; операции сборки/обновления могут быть рискованны.')
+    if servers['apache_worker_limit']:
+        alert('info', 'APACHE_LIMIT', 'Обнаружены ограничения MaxRequestWorkers',
+              'Лимит процессов следует сравнить с реальной нагрузкой и потреблением памяти; автоматически не изменяется.')
+    if core_rpms['status'] == 'ambiguous':
+        found = ', '.join(p['name'] + ' ' + p['version'] + '-' + p['release']
+                          for p in core_rpms['packages'] if p['name'] in core_rpms['duplicates'])
+        alert('critical', 'PHP_CORE_RPM_AMBIGUOUS', 'Несколько RPM одного базового пакета PHP',
+              found + '. Требуется разбор дублей и согласование пакетов на клоне.')
+    elif core_rpms['status'] == 'mismatch':
+        found = ', '.join(p['name'] + ' ' + p['version'] for p in core_rpms['mismatches'])
+        alert('critical', 'PHP_CORE_RPM_MISMATCH', 'Базовые RPM отличаются от PHP CLI',
+              'PHP CLI ' + php['version'] + '. Отличаются ' + found + '.')
+    elif core_rpms['status'] == 'incomplete':
+        alert('warning', 'PHP_CORE_RPM_INCOMPLETE', 'Неполный базовый комплект RPM PHP',
+              'Не найдены ' + ', '.join(core_rpms['missing']) +
+              '. Для профиля Apache/mod_php мастеру нужны php, php-cli и php-common.')
+    if pkg_err:
+        alert('info', 'PKG_UNAVAILABLE', 'Нет полной информации об RPM', pkg_err)
+    if args.url and not args.offline:
+        probe = url_probe(args.url)
+        if probe['status'] not in ('ok',):
+            alert('warning', 'WEB_HTTP_ERROR', 'Проверка сайта не завершилась успешно',
+                  'Проверьте URL, HTTP-ответ и журналы веб-сервера.')
+    else:
+        probe = None
+    alerts.sort(key=lambda x: (RISK_PRIORITIES[x['level']], x['code']))
+    decision = 'uncertain'
+    if any(x['level'] == 'critical' for x in alerts):
+        decision = 'manual_review'
+    elif core_rpms['status'] == 'incomplete':
+        decision = 'uncertain'
+    elif update['status'] == 'ok' and php['version']:
+        installed = tuple(map(int, php['version'].split('.')))
+        published = tuple(map(int, update['version'].split('.')))
+        if published > installed:
+            decision = 'update_available'
+        elif published == installed and php_life['status'] == 'supported':
+            decision = 'patch_current'
+    legacy_php = bool(re.fullmatch(r'(?:[57]\.[0-9]+|8\.[01])', branch(php['version']) or ''))
+    el7 = os_ver.split('.')[0] == '7' and ostype in ('centos', 'rhel', 'ol', 'oraclelinux', 'scientific')
+    if core_rpms['status'] == 'ambiguous':
+        next_step = ('На клоне разберите дубли базовых RPM по журналу пакетных операций и восстановите '
+                     'согласованный комплект из доверенного источника. Проверьте сайт и повторите '
+                     'bash install.sh --check.')
+    elif core_rpms['status'] == 'mismatch':
+        next_step = ('На клоне восстановите согласованный комплект php/php-cli/php-common из доверенного источника, '
+                     'проверьте сайт и повторите bash install.sh --check.')
+    elif core_rpms['status'] == 'incomplete':
+        next_step = ('Уточните способ запуска PHP на сервере. Для обновления этим мастером нужен профиль '
+                     'Apache/mod_php с пакетами php, php-cli и php-common одной версии. '
+                     'Выберите способ обновления для фактического веб-PHP и проверьте его на клоне.')
+    else:
+        next_step = 'bash install.sh --plan' if args.full and el7 and legacy_php else None
+    return {
+        'schema': 'bitrix-server-master/diagnostic-v1', 'tool_version': VERSION,
+        'timestamp_utc': iso_now(), 'hostname': socket.gethostname(),
+        'mode': 'full' if args.full else 'quick' if args.quick else 'standard',
+        'readonly': True,
+        'system': {'name': osrel.get('PRETTY_NAME', platform.platform()), 'id': ostype,
+                   'version': os_ver, 'arch': platform.machine(), 'kernel': platform.release(),
+                   'os_lifecycle': os_life, 'root': os.geteuid() == 0 if hasattr(os, 'geteuid') else False},
+        'bitrix': bitrix_info(pkgs, args.full, pkg_err), 'php': {**php, 'lifecycle': php_life},
+        'web': servers, 'database': db_info(pkgs),
+        'resources': {'memory_mib': ram, 'disks': [x for x in disks if x]},
+        'rpm': {'installed_count': len(pkgs), 'php_packages': get_packages(pkgs, r'^php(-|$)')[:80],
+                'error': pkg_err, 'core_php': core_rpms}, 'repositories': repos() if args.full else {'note': 'Подробности доступны с --full'},
+        'update_check': update, 'site_probe': probe,
+        'conclusion': {'code': decision, 'automated_update_permitted': False,
+                       'message': conclusion_text(decision, os_life, php_life),
+                       'next_step': next_step},
+        'alerts': alerts,
+        'limitations': ['Версия PHP в Apache/PHP-FPM не подтверждается без отдельного защищённого веб-теста.',
+                        'Результат не является тестом безопасности и не заменяет резервное копирование.',
+                        'Наличие HTTP 200 не доказывает исправность всех функций Битрикса.'] +
+                       (['Сайты определяются в /home/bitrix/www и /home/bitrix/ext_www/* по данным файловой системы. '
+                         'Активные виртуальные хосты и сайты за пределами этих путей не проверяются.',
+                         'Версии ядра и модулей извлекаются из ограниченного набора файлов. Регистрация модулей в БД не проверяется.',
+                         'Имена участников пула берутся из группы bitrix-hosts, роли из известных групп локального INI-инвентаря Ansible. '
+                         'Доступность хостов не проверяется.']
+                        if args.full else [])
+    }
+
+
+def conclusion_text(decision, os_life, php_life):
+    if os_life['status'] == 'ended':
+        return 'Нужен план миграции устаревшей ОС. Обновление одного PHP не устраняет риски системы.'
+    if php_life['status'] == 'ended':
+        return 'Требуется переход на поддерживаемую ветку PHP после проверки совместимости.'
+    if decision == 'manual_review':
+        return 'Обнаружены критические проблемы. Сначала проверьте соответствующие предупреждения.'
+    if decision == 'update_available':
+        return 'Найдена более новая патч-версия PHP. Обновление возможно только после проверки совместимости.'
+    if decision == 'patch_current':
+        return 'На момент сетевой проверки PHP.net опубликована та же патч-версия PHP; это не проверка безопасности всего сервера.'
+    return 'Для заключения об актуальности PHP нужны дополнительные проверки; система автоматически не изменялась.'
+
+
+def fmt_bytes_gb(gb):
+    return f'{gb:.2f} ГБ' if gb is not None else 'неизвестно'
+
+
+def print_human(rep):
+    color = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb' and not os.environ.get('NO_COLOR')
+
+    def status(level, text, indent=' '):
+        label, code = {'ok': ('[OK]', 32), 'warning': ('[ВНИМАНИЕ]', 33),
+                       'critical': ('[КРИТИЧНО]', 31), 'info': ('[ИНФО]', 36)}[level]
+        line = f'{label} {text}'
+        if color:
+            line = f'\x1b[{code}m{line}\x1b[0m'
+        print(indent + line)
+
+    print('\n' + '=' * 66)
+    print(f" BITRIX SERVER MASTER {VERSION} — ДИАГНОСТИКА (ТОЛЬКО ЧТЕНИЕ)")
+    print('=' * 66)
+
+    cli_version = rep['php']['version']
+    target = os.environ.get('BITRIX_MASTER_TARGET_PHP', '')
+    installed = tuple(map(int, cli_version.split('.'))) if cli_version else None
+    pinned = tuple(map(int, target.split('.'))) if re.fullmatch(r'\d+\.\d+\.\d+', target) else None
+    core_rpms = rep['rpm']['core_php']
+    if not installed:
+        status('warning', 'PHP CLI — версия не определена' + (f' (цель {target})' if pinned else ''))
+    elif not pinned:
+        status('info', f'PHP CLI {cli_version} — цель мастера не задана')
+    elif rep['php']['module_errors']:
+        status('critical', f'PHP CLI {cli_version} — ошибки загрузки модулей')
+    elif installed == pinned:
+        level = 'info' if core_rpms['status'] in ('mismatch', 'incomplete', 'ambiguous') else 'ok'
+        status(level, f'PHP CLI {cli_version} — обновление до целевой версии не требуется')
+    elif installed < pinned:
+        status('warning', f'PHP CLI {cli_version} — версия ниже целевой {target}')
+    else:
+        status('info', f'PHP CLI {cli_version} — версия выше целевой {target}')
+
+    if core_rpms['status'] == 'ambiguous':
+        found = ', '.join(p['name'] + ' ' + p['version'] + '-' + p['release']
+                          for p in core_rpms['packages'] if p['name'] in core_rpms['duplicates'])
+        status('critical', 'Несколько RPM одного базового пакета — ' + found + '.')
+    elif core_rpms['status'] == 'mismatch':
+        found = ', '.join(p['name'] + ' ' + p['version'] for p in core_rpms['mismatches'])
+        status('critical', 'Базовые RPM отличаются от PHP CLI — ' + found + '.')
+    elif core_rpms['status'] == 'incomplete':
+        status('warning', 'Базовые RPM — не найдены ' + ', '.join(core_rpms['missing']) + '.')
+    elif core_rpms['status'] == 'confirmed':
+        status('ok', 'RPM php, php-cli и php-common совпадают с PHP CLI ' + cli_version + '.')
+    else:
+        status('info', 'Базовые RPM PHP не подтверждены — ' + core_rpms['reason'] + '.')
+
+    update = rep['update_check']
+    published = None
+    if update['status'] == 'ok':
+        latest = update['version']
+        published = tuple(map(int, latest.split('.')))
+        if installed and published > installed:
+            status('warning', f'PHP.net {latest} — опубликован более новый патч в этой ветке')
+        elif published == installed:
+            status('ok', f'PHP.net {latest} — версия совпадает с PHP CLI')
+        else:
+            status('info', f'PHP.net {latest} — опубликованная патч-версия ниже PHP CLI')
+    elif update['status'] == 'skipped':
+        status('info', 'PHP.net — проверка пропущена (--offline)')
+    elif update['status'] == 'unavailable':
+        status('info', 'PHP.net — проверка недоступна. ' + update['reason'])
+    else:
+        status('info', 'PHP.net — проверка не запрошена')
+
+    status('info', 'PHP сайта не подтверждён. Аудит показывает версию PHP CLI.')
+    system = rep['system']
+    os_life = system['os_lifecycle']
+    if os_life['status'] == 'ended':
+        status('critical', f"ОС {system['name']} — поддержка завершилась {os_life['deadline']}")
+    elif os_life['status'] == 'supported':
+        status('ok', f"ОС {system['name']} — срок поддержки по справочнику до {os_life['deadline']}")
+    else:
+        status('info', f"ОС {system['name']} — срок поддержки не определён")
+
+    if core_rpms['status'] in ('mismatch', 'incomplete', 'ambiguous'):
+        action = rep['conclusion']['next_step']
+    elif rep['conclusion'].get('next_step'):
+        action = 'посмотрите маршрут PHP командой ' + rep['conclusion']['next_step'] + '.'
+    elif not installed:
+        action = 'проверьте наличие и запуск PHP CLI командой php -v.'
+    elif rep['php']['module_errors']:
+        action = 'проверьте ошибки загрузки модулей командой php -m.'
+    elif os_life['status'] == 'ended':
+        action = 'запланируйте миграцию на поддерживаемую ОС.'
+    elif rep['php']['lifecycle']['status'] == 'ended':
+        action = 'проверьте совместимость сайта с поддерживаемой веткой PHP.'
+    elif published and published > installed:
+        action = 'проверьте совместимость опубликованного патча на клоне сервера.'
+    elif pinned and installed < pinned:
+        action = f'проверьте совместимость с PHP {target} на клоне сервера.'
+    else:
+        action = 'подтвердите версию PHP в веб-сервере защищённой проверкой.'
+    status('info', 'Следующий шаг — ' + action)
+
+    print('\n ПОДРОБНОСТИ')
+    print(' Сервер:          ' + rep['hostname'])
+    print(' Дата UTC:        ' + rep['timestamp_utc'])
+    print(' Архитектура:     ' + rep['system']['arch'])
+    bitrix = rep['bitrix']
+    labels = {
+        'confirmed': 'подтверждено по RPM', 'ambiguous': 'несколько вариантов версии',
+        'file_only': 'по локальным файлам', 'unknown': 'не определено',
+        'missing': 'не найдено', 'permission_denied': 'нет прав доступа',
+        'unavailable': 'недоступно', 'limited': 'частичные данные',
+        'present': 'найден исполняемый файл', 'not_executable': 'нет бита исполнения',
+    }
+    env = bitrix['environment']
+    status_text = labels[env['status']]
+    if env['version']:
+        status_text = env['version'] + ' (' + status_text + ')'
+    elif not bitrix['detected']:
+        status_text = 'признаки окружения не найдены'
+    print(' BitrixEnv:       ' + status_text)
+    if env['packages']:
+        rows = [p['name'] + ' ' + p['version'] + '-' + p['release'] for p in env['packages'][:4]]
+        extra = f" (ещё {len(env['packages']) - 4})" if len(env['packages']) > 4 else ''
+        print(' RPM BitrixEnv:   ' + ', '.join(rows) + extra)
+    if rep['mode'] == 'full':
+        sites, pool, menu = bitrix['sites'], bitrix['pool'], bitrix['menu']
+        print(' Сайты:           ' + labels[sites['status']] + ' (стандартные каталоги)')
+        for site in sites['items'][:8]:
+            core, modules = site['core'], site['modules']
+            version_text = core['version'] or labels[core['status']]
+            count = len(modules['items'])
+            print(f"   {site['root']} — ядро {version_text}, версий модулей {count} ({labels[modules['status']]})")
+        if len(sites['items']) > 8:
+            print(f"   Ещё {len(sites['items']) - 8} каталогов в JSON.")
+        print(' Пул BitrixVM:    ' + labels[pool['status']])
+        for host in pool['hosts'][:8]:
+            print('   ' + host['name'] + ' — ' + (', '.join(host['roles']) or 'роль не указана'))
+        if len(pool['hosts']) > 8:
+            print(f"   Ещё {len(pool['hosts']) - 8} хостов в JSON.")
+        print(' Меню BitrixVM:   ' + labels[menu['status']] + ' (' + menu['path'] + ')')
+    print(' Apache:          ' + str(rep['web']['apache']['version'] or 'не определён') + ', служба ' + rep['web']['apache']['active'])
+    print(' mod_php:         ' + ({True:'да', False:'нет', None:'неизвестно'}[rep['web']['apache']['mod_php']]))
+    print(' PHP-FPM:         ' + rep['web']['php_fpm']['active'])
+    print(' Nginx:          ' + str(rep['web']['nginx']['version'] or 'не определён') + ', служба ' + rep['web']['nginx']['active'])
+    names = rep['database']['server_packages']
+    print(' БД, пакеты:      ' + (', '.join(p['name']+' '+p['version'] for p in names) or 'нет данных'))
+    mem = rep['resources']['memory_mib']
+    print(' ОЗУ:             ' + (str(mem.get('MemTotal'))+' МиБ' if mem.get('MemTotal') else 'неизвестно'))
+    print(' Доступно ОЗУ:    ' + (str(mem.get('MemAvailable'))+' МиБ' if mem.get('MemAvailable') is not None else 'неизвестно'))
+    print(' Диск /:         ' + ', '.join(fmt_bytes_gb(x['available_gb'])+' доступно' for x in rep['resources']['disks'] if x['path'] == '/'))
+    print('\n РЕЗУЛЬТАТЫ ПРОВЕРОК:')
+    if not rep['alerts']:
+        print('   Нет предупреждений в рамках выполненных проверок.')
+    for a in rep['alerts']:
+        status(a['level'], a['title'], '   ')
+        print('     ' + a['detail'])
+    print('\n Действия на сервере: никаких обновлений и перезапусков.')
+    if rep['site_probe']:
+        print(' Проверка URL:', rep['site_probe'])
+    print('=' * 66 + '\n')
+
+
+def safe_write_report(rep, path):
+    if path == 'AUTO':
+        name = re.sub(r'[^A-Za-z0-9_.-]', '_', rep['hostname'])[:50]
+        stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+        path = f'./bitrix-audit-{name}-{stamp}.json'
+    path = os.path.abspath(os.path.expanduser(path))
+    # Refuse overwrite and symlink targets; use restrictive file mode from creation onward.
+    old = os.umask(0o077)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(rep, fh, ensure_ascii=False, indent=2)
+            fh.write('\n')
+    finally:
+        os.umask(old)
+    return path
+
+
+def reported_bitrix_version(report):
+    bitrix = report.get('bitrix')
+    if not isinstance(bitrix, dict):
+        return None
+    ver, packages = bitrix.get('version'), bitrix.get('packages')
+    if 'environment' in bitrix or not isinstance(packages, list):
+        return ver
+    # Older reports saved RPM VERSION alone. Reuse their recorded RELEASE for comparison.
+    rows = [p for p in packages if isinstance(p, dict) and p.get('name') in BITRIX_ENV_RPM_NAMES]
+    if len(rows) == 1 and rows[0].get('version') == ver:
+        return bitrix_rpm_version(rows[0]) or ver
+    return ver
+
+
+def compare_reports(paths, json_out):
+    reports = []
+    for p in paths:
+        with open(p, 'r', encoding='utf-8') as fh:
+            obj = json.load(fh)
+        if not isinstance(obj, dict) or obj.get('schema') != 'bitrix-server-master/diagnostic-v1':
+            raise ValueError('Файл не является отчётом Bitrix Server Master: ' + p)
+        reports.append(obj)
+    old, new = reports
+    if old.get('hostname') != new.get('hostname'):
+        raise ValueError('Отчёты относятся к разным именам серверов. Сравнение отменено.')
+    changes = []
+    for label, path in [('ОС', ('system', 'name')), ('BitrixEnv', ('bitrix', 'version')),
+                        ('PHP CLI', ('php', 'version')), ('Apache', ('web', 'apache', 'version')),
+                        ('Nginx', ('web', 'nginx', 'version')),
+                        ('Apache: служба', ('web', 'apache', 'active'))]:
+        def get(obj):
+            for x in path:
+                obj = obj.get(x) if isinstance(obj, dict) else None
+            return obj
+        if path == ('bitrix', 'version'):
+            a, b = reported_bitrix_version(old), reported_bitrix_version(new)
+        else:
+            a, b = get(old), get(new)
+        if a != b:
+            changes.append({'component': label, 'before': a, 'after': b})
+    a_codes = {x['code'] for x in old.get('alerts', [])}
+    b_codes = {x['code'] for x in new.get('alerts', [])}
+    result = {'server': new['hostname'], 'before': old['timestamp_utc'],
+              'after': new['timestamp_utc'], 'changes': changes,
+              'resolved_alerts': sorted(a_codes-b_codes), 'new_alerts': sorted(b_codes-a_codes)}
+    if json_out:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print('СРАВНЕНИЕ ОТЧЁТОВ:', result['server'])
+        print('Было:', result['before'], '| Стало:', result['after'])
+        if not changes:
+            print('Изменений по отслеживаемым полям не найдено.')
+        for x in changes:
+            print(' - {component}: {before} -> {after}'.format(**x))
+        print('Исчезли предупреждения:', ', '.join(result['resolved_alerts']) or 'нет')
+        print('Появились предупреждения:', ', '.join(result['new_alerts']) or 'нет')
+    return 0
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog='bash install.sh', description='Bitrix Server Master 1.0 — русскоязычная безопасная диагностика')
+    parser.add_argument('-d', '--diagnose', action='store_true', help='диагностика без изменения системы')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--quick', action='store_true', help='краткая диагностика')
+    group.add_argument('--full', action='store_true', help='расширенная диагностика')
+    parser.add_argument('--json', action='store_true', help='вывести JSON в stdout')
+    parser.add_argument('--report', nargs='?', const='AUTO', metavar='ФАЙЛ', help='сохранить JSON-отчёт (создаёт только указанный файл)')
+    parser.add_argument('--check-updates', action='store_true', help='сверить патч-версию PHP с php.net по HTTPS')
+    parser.add_argument('--offline', action='store_true', help='не обращаться к сети')
+    parser.add_argument('--url', metavar='URL', help='проверить HTTP-ответ указанного сайта HEAD-запросом (оставляет запись в access.log)')
+    parser.add_argument('--compare', nargs=2, metavar=('СТАРЫЙ_JSON', 'НОВЫЙ_JSON'), help='сравнить два сохранённых отчёта')
+    parser.add_argument('--version', action='version', version='Bitrix Server Master ' + VERSION)
+    return parser.parse_args(argv)
+
+
+def interactive():
+    while True:
+        print('\nBITRIX SERVER MASTER', VERSION)
+        print(' 1. Диагностика сервера')
+        print(' 2. Полная диагностика + проверка обновлений PHP')
+        print(' 3. Полная диагностика + сохранение отчёта')
+        print(' 4. Обновление PHP (показать команды)')
+        print(' 0. Выход')
+        try:
+            answer = input('Ваш выбор: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\nВыход.'); return 0
+        if answer == '0':
+            return 0
+        if answer == '4':
+            print('План: bash install.sh --plan')
+            print('Сборка на клоне: bash install.sh --build --builder')
+            print('Установка готовых RPM: bash install.sh --help')
+            continue
+        if answer not in ('1', '2', '3'):
+            print('Неизвестный пункт меню.'); continue
+        sub = parse_args(['--diagnose'] + (['--full'] if answer in ('2', '3') else []) +
+                         (['--check-updates'] if answer == '2' else []) +
+                         (['--report'] if answer == '3' else []))
+        diagnose(sub)
+
+
+def diagnose(args):
+    rep = report_for(args)
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print_human(rep)
+    if args.report:
+        try:
+            path = safe_write_report(rep, args.report)
+            print('Отчёт сохранён:', path, file=sys.stderr if args.json else sys.stdout)
+        except OSError as e:
+            print('Не удалось сохранить отчёт: ' + str(e), file=sys.stderr)
+            return 3
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    args = parse_args(argv)
+    if args.compare:
+        try:
+            return compare_reports(args.compare, args.json)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print('Ошибка сравнения: ' + str(e), file=sys.stderr)
+            return 3
+    if argv or args.diagnose:
+        return diagnose(args)
+    if not sys.stdin.isatty():
+        print('Интерактивное меню требует терминал; запускаю диагностику.')
+        return diagnose(parse_args(['--diagnose']))
+    return interactive()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\nОперация прервана пользователем.', file=sys.stderr)
+        sys.exit(130)
+
+__PYTHON_PAYLOAD_END__
