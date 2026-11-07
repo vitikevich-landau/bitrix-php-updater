@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Bitrix Server Master 1.0.0-rc8 — диагностика и пилотное обновление PHP 8.2.35.
+# Bitrix Server Master 1.0.0-rc9 — диагностика и пилотное обновление PHP 8.2.35.
 set -o pipefail
 umask 077
 export LC_ALL=C
-MASTER_VERSION='1.0.0-rc8'
+MASTER_VERSION='1.0.0-rc9'
+MANAGED_SITE=''
 PY_RELEASE='3.11.18'
 PY_BUILD='20261026'
 PY_ARTIFACT='cpython-3.11.18+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
@@ -696,7 +697,7 @@ quick_check() {
     esac
 
     if [ -z "$url" ]; then
-        status_line info 'Веб-PHP не проверялся. Для проверки нужен закрытый URL сайта.'
+        status_line info 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
     elif [ -z "$cli" ]; then
         status_line warning 'Сайт: веб-PHP не проверен. Не определена ожидаемая версия PHP.'
         web_rc=63
@@ -721,7 +722,7 @@ show_plan() {
     printf 'BITRIX SERVER MASTER %s — план обновления\n' "$MASTER_VERSION"
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
     route="$(php_version_route "$cli")"
-    status_line info 'Веб-PHP не проверялся. Для проверки используйте --check --url URL закрытого теста.'
+    status_line info 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
     if [[ "$cli" =~ ^8\.2\.[0-9]+$ ]]; then
         if detail="$(profile_check 2>&1)"; then
             profile_rc=0
@@ -761,11 +762,13 @@ show_plan() {
     fi
     cat <<'EOF'
 1. Проверьте резервную копию или снимок ВМ и доступ к консоли гипервизора.
-2. Подготовьте на отдельной ВМ новые RPM и полный комплект точных старых RPM.
-3. Подпишите манифесты и подготовьте доверенный публичный keyring.
-4. Подготовьте закрытый URL проверки Apache/PHP на самом узле.
-5. Проверьте на клоне установку, функциональность сайта и откат по ID сессии.
+2. На клоне от root выполните --check-site и выберите сайт для временной проверки.
+3. Запустите --auto-update (при необходимости --site ИМЯ): мастер настроит выпуск
+   и ключ, проверит подписи, скачает новые RPM и точный прежний комплект для отката.
+4. Подтвердите проверенный снимок и установку. Проверьте админку и функции сайта.
+5. Выполните откат по ID исходной сессии и подтвердите работу прежнего PHP и сайта.
 6. Согласуйте окно обслуживания и повторите проверенную процедуру.
+Если точного старого RPM нет в выпуске, владелец должен добавить его в подписанный архив.
 CentOS 7 снята с поддержки. Поддержка PHP 8.2 завершается 31.12.2026.
 EOF
 }
@@ -1073,7 +1076,7 @@ verify_rpm_catalog() (
 load_auto_config() {
     local config="$1" line key value
     local -A seen=()
-    AUTO_SOURCE='' AUTO_KEYRING='' AUTO_HEALTH_URL=''
+    AUTO_SOURCE='' AUTO_KEYRING='' AUTO_HEALTH_URL='' AUTO_SITE=''
     if ! config="$(trusted_rpm_keyring "$config")" || [ "$(stat -c %s -- "$config")" -gt 16384 ]; then
         err 'Нужна конфигурация автоматического обновления в защищённом файле root. Выполните настройку через меню.'; return 80
     fi
@@ -1084,7 +1087,7 @@ load_auto_config() {
             err 'Конфигурация должна содержать строки SOURCE=, KEYRING= и HEALTH_URL=.'; return 80
         fi
         key="${line%%=*}"; value="${line#*=}"
-        if ! [[ "$key" =~ ^(SOURCE|KEYRING|HEALTH_URL)$ ]]; then
+        if ! [[ "$key" =~ ^(SOURCE|KEYRING|HEALTH_URL|SITE)$ ]]; then
             err "Неизвестное поле конфигурации: $key"; return 80
         fi
         if [ -z "$key" ] || [ -n "${seen[$key]:-}" ] || [ -z "$value" ] || [[ "$value" =~ [[:cntrl:]] ]]; then
@@ -1094,6 +1097,7 @@ load_auto_config() {
             SOURCE) AUTO_SOURCE="$value" ;;
             KEYRING) AUTO_KEYRING="$value" ;;
             HEALTH_URL) AUTO_HEALTH_URL="$value" ;;
+            SITE) AUTO_SITE="$value" ;;
             *) err "Неизвестное поле конфигурации: $key"; return 80 ;;
         esac
         seen["$key"]=1
@@ -1105,7 +1109,8 @@ load_auto_config() {
     if ! [[ "$AUTO_SOURCE" == /* || "$AUTO_SOURCE" =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?(/[a-zA-Z0-9_./~%+@=-]*)?$ ]]; then
         err 'SOURCE должен быть абсолютным путём или HTTPS-адресом каталога без учётных данных и параметров.'; return 80
     fi
-    health_url_parts "$AUTO_HEALTH_URL" >/dev/null || return 80
+    if [ -n "$AUTO_SITE" ]; then validate_managed_site "$AUTO_SITE" || return 80; fi
+    if [ "$AUTO_HEALTH_URL" != auto ]; then health_url_parts "$AUTO_HEALTH_URL" >/dev/null || return 80; fi
 }
 
 fetch_auto_asset() {
@@ -1132,7 +1137,7 @@ prepare_auto_catalog() {
 }
 
 run_auto_update() (
-    local config="$1" unattended="$2" work='' record identity name line digest current
+    local config="$1" unattended="$2" selector="${3:-}" work='' record identity name line digest current
     local -A old_hashes=()
     require_root || return
     need rpm php httpd systemctl curl awk sort grep cmp cp chmod stat mktemp || return
@@ -1141,6 +1146,12 @@ run_auto_update() (
     fi
     current="$PHP_CURRENT"
     load_auto_config "$config" || return
+    MANAGED_SITE=''
+    if [ -n "$selector" ]; then AUTO_HEALTH_URL=auto; fi
+    if [ "$AUTO_HEALTH_URL" = auto ]; then
+        select_managed_site "${selector:-$AUTO_SITE}" "$unattended" || return
+    fi
+    health_target_validate "$AUTO_HEALTH_URL" || return 80
     if [ "$current" = "$TARGET_PHP" ]; then
         run_update '' "$AUTO_HEALTH_URL" '' '' "$unattended"; return
     fi
@@ -1199,7 +1210,9 @@ run_auto_update() (
 )
 
 auto_update_dispatch() {
-    local config='/etc/bitrix-php-update.conf' unattended=0 backup_verified=0 use_default=1
+    local config='/etc/bitrix-php-update.conf' unattended=0 backup_verified=0 use_default=1 selector=''
+    local -a setup_options=()
+    MANAGED_SITE=''
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --config)
@@ -1207,6 +1220,11 @@ auto_update_dispatch() {
                     err 'Укажите путь после --config.'; return 2
                 fi
                 config="$2"; use_default=0; shift 2 ;;
+            --site)
+                if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+                    err 'Укажите имя сайта или DocumentRoot после --site.'; return 2
+                fi
+                selector="$2"; shift 2 ;;
             --unattended) unattended=1; shift ;;
             --backup-verified) backup_verified=1; shift ;;
             *) err "Параметр $1 недопустим для --auto-update."; return 2 ;;
@@ -1215,11 +1233,15 @@ auto_update_dispatch() {
     if [ "$unattended" != "$backup_verified" ]; then
         err 'Для обновления без запросов параметры --unattended и --backup-verified нужны вместе.'; return 2
     fi
-    if [ "$use_default" = 1 ] && [ "$unattended" = 0 ] && [ -t 0 ] &&
-       [ ! -e "$config" ] && [ ! -L "$config" ]; then
-        setup_auto_update || return
+    if [ "$use_default" = 1 ] && [ ! -e "$config" ] && [ ! -L "$config" ]; then
+        [ -z "$selector" ] || setup_options+=(--site "$selector")
+        [ "$unattended" = 0 ] || setup_options+=(--unattended)
+        setup_auto_update "${setup_options[@]}" || return
+        # Setup saved the exact vhost record, including an interactive choice.
+        # Reusing a hostname or DocumentRoot selector could ask the same question twice.
+        selector=''
     fi
-    run_auto_update "$config" "$unattended"
+    run_auto_update "$config" "$unattended" "$selector"
 }
 
 # Проверяем подпись и хеши копий в новом закрытом каталоге сессии.
@@ -1407,8 +1429,17 @@ health_url_parts() {
     printf '%s %s\n' "$host" "$port"
 }
 
+health_target_validate() {
+    if [ "$1" = auto ]; then
+        validate_managed_site "${MANAGED_SITE:-}"
+    else
+        health_url_parts "$1" >/dev/null
+    fi
+}
+
 http_check() (
     local url="$1" expected="$2" address host port response marker
+    if [ "$url" = auto ]; then managed_http_check "$expected"; return; fi
     address="$(health_url_parts "$url")" || return
     [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err 'Не задана ожидаемая версия веб-PHP.'; return 63; }
     need curl head cmp mktemp || return
@@ -1554,9 +1585,14 @@ run_update() {
     local -a update_rpms rollback_rpms
     require_root || return
     need rpm php httpd systemctl curl tar awk sort grep cmp cp chmod sync || return
-    health_url_parts "$url" >/dev/null || return 61
+    health_target_validate "$url" || return 61
     session_setup || return
     dir="$SESSION_DIR"
+    if [ "$url" = auto ] && ! managed_site_save "$dir/site-probe"; then
+        err 'Не удалось сохранить описание сайта для проверки после отката.'
+        mark_state precheck_failed
+        return 61
+    fi
     profile_check || { mark_state precheck_failed; return 61; }
     if [ "$PHP_CURRENT" = "$TARGET_PHP" ]; then
         if ! inventory_php_rpms > "$dir/rpm-recheck.txt" ||
@@ -1798,7 +1834,7 @@ run_rollback() {
         mark_state rollback_precheck_failed
         return 71
     fi
-    for file in state rpm-before.txt rpm-target.txt php-version-before.txt php-modules-before.txt url configuration.tar.gz trusted-keyring.gpg; do
+    for file in state rpm-before.txt rpm-target.txt php-version-before.txt php-modules-before.txt configuration.tar.gz trusted-keyring.gpg; do
         if ! private_session_file "$source/$file" || [ ! -s "$source/$file" ]; then
             err "В сессии $id нет пригодного файла восстановления: $file"
             mark_state rollback_precheck_failed
@@ -1811,14 +1847,30 @@ run_rollback() {
         *) err "Состояние «$state» не допускает отката RPM."; mark_state rollback_precheck_failed; return 71 ;;
     esac
     old_php="$(cat "$source/php-version-before.txt")" || return 71
-    original_url="$(cat "$source/url")" || return 71
-    url="${url:-$original_url}"
-    if [[ ! "$old_php" =~ ^8\.2\.[0-9]+$ ]] || ! health_url_parts "$url" >/dev/null; then
-        err 'В сессии не указана корректная версия PHP или указан недопустимый URL.'
+    MANAGED_SITE=''
+    if [ -z "$url" ] && { [ -e "$source/site-probe" ] || [ -L "$source/site-probe" ]; }; then
+        if ! managed_site_load "$source/site-probe"; then
+            err 'В сессии повреждено или небезопасно описание сайта.'
+            mark_state rollback_precheck_failed
+            return 71
+        fi
+        url=auto
+    elif [ -z "$url" ]; then
+        if ! private_session_file "$source/url" || [ ! -s "$source/url" ]; then
+            err 'В сессии нет защищённой цели проверки сайта.'
+            mark_state rollback_precheck_failed
+            return 71
+        fi
+        original_url="$(cat "$source/url")" || return 71
+        url="$original_url"
+    fi
+    if [[ ! "$old_php" =~ ^8\.2\.[0-9]+$ ]] || ! health_target_validate "$url"; then
+        err 'В сессии не указана корректная версия PHP или цель проверки сайта.'
         mark_state rollback_precheck_failed
         return 71
     fi
     printf '%s\n' "$url" > "$dir/url" || return 71
+    if [ "$url" = auto ]; then managed_site_save "$dir/site-probe" || return 71; fi
     if ! rpm_core_snapshot > "$dir/rpm-before.txt" ||
        ! plan_rpm_rollback "$source/rpm-before.txt" "$source/rpm-target.txt" "$dir/rpm-before.txt" > "$dir/rpm-rollback-plan.txt"; then
         err 'Состав RPM не соответствует этому обновлению. Проверьте состояние сервера перед восстановлением.'
@@ -1945,10 +1997,12 @@ show_status() {
 
 update_help() {
     cat <<'EOF'
-BITRIX SERVER MASTER 1.0.0-rc8 — диагностика и пилотное обновление PHP
+BITRIX SERVER MASTER 1.0.0-rc9 — диагностика и пилотное обновление PHP
 
 Проверка и отчёт
   bash install.sh --check
+  bash install.sh --check-site
+  bash install.sh --check-site --site site.ru
   bash install.sh --check --url https://site.ru/_php_health.php
   bash install.sh --audit
   bash install.sh --audit --offline --report ./audit-full.json
@@ -1956,6 +2010,11 @@ BITRIX SERVER MASTER 1.0.0-rc8 — диагностика и пилотное о
 
 --check проверяет целевую версию PHP без Python и доступа к интернету.
 С --url он проверяет настроенный локальный маршрут веб-PHP.
+--check-site от root находит сайт Apache, создаёт временный закрытый PHP-тест,
+проверяет веб-PHP и удаляет тест. При нескольких сайтах предложит выбрать.
+Без терминала укажите --site с именем сайта или абсолютным DocumentRoot.
+Это проверка PHP/расширений через Apache; nginx, БД и функции Битрикса
+проверяйте отдельно. --check и --audit временные тесты не создают.
 --audit собирает данные, сверяет патч PHP с PHP.net и сохраняет JSON.
 --plan показывает цепочку перехода на PHP 8.2 для обнаруженного BitrixEnv.
 Переходы между ветками администратор запускает через меню /root/menu.sh.
@@ -1981,14 +2040,20 @@ BITRIX SERVER MASTER 1.0.0-rc8 — диагностика и пилотное о
   bash install.sh --auto-update
   bash install.sh --auto-update --unattended --backup-verified
   bash install.sh --auto-update --config /root/client-update.conf
-Первый интерактивный запуск предложит настройку закрытой проверки сайта.
+  bash install.sh --auto-update --site site.ru
+При первом запуске --auto-update сам настраивает выпуск, закреплённый ключ
+и автоматическую проверку сайта. Готовить PHP-файл или URL вручную не нужно.
+--setup-update повторяет настройку; для выбора сайта можно добавить --site.
+Поддерживаются прежние конфигурации с HEALTH_URL=http(s)://... .
 
 Установка из готовых подписанных комплектов RPM
   bash install.sh --update --rpm-dir /path/NEW_RPMS --rollback-dir /path/OLD_RPMS \
-       --rpm-keyring /root/rpm-signing.gpg --url https://site.ru/_php_health.php
+       --rpm-keyring /root/rpm-signing.gpg [--site site.ru]
 
-В каждом каталоге нужны SHA256SUMS и SHA256SUMS.asc. URL должен вернуть HTTP 200
-и строку BITRIX_MASTER_OK <версия PHP> apache2handler. Подготовка описана в README.
+В каждом каталоге нужны SHA256SUMS и SHA256SUMS.asc. Сайт проверяется временным
+автоматическим тестом. Расширенный режим --url https://site.ru/_php_health.php
+использует существующий закрытый тест: HTTP 200 и единственная строка
+BITRIX_MASTER_OK <версия PHP> apache2handler.
 Для запуска без запросов добавьте --unattended --backup-verified только после
 проверки актуального снимка ВМ или полной резервной копии сервера.
 
@@ -1997,6 +2062,8 @@ BITRIX SERVER MASTER 1.0.0-rc8 — диагностика и пилотное о
   bash install.sh --status
 
 Добавьте --unattended, чтобы подтвердить откат указанной сессии без запроса.
+Откат использует сохранённое описание сайта и создаёт тест после восстановления.
+Для смены маршрута проверки можно явно указать --url URL существующего теста.
 
 Прочее
   bash install.sh --bootstrap-python
@@ -2182,8 +2249,9 @@ prepare_release_dispatch() {
 
 
 updater_dispatch() {
-    local mode="$1" rpmdir='' olddir='' keyring='' srpm='' url='' session='' builder=0
+    local mode="$1" rpmdir='' olddir='' keyring='' srpm='' url='' session='' builder=0 selector=''
     local unattended=0 backup_verified=0
+    MANAGED_SITE=''
     shift
     while [ "$#" -gt 0 ]; do
         case "$mode:$1" in
@@ -2203,7 +2271,7 @@ updater_dispatch() {
           --rollback:--rpm-dir)
             err 'Откат привязан к записанной сессии. Используйте --rollback --session ID.'
             return 2 ;;
-          --build:--srpm|--update:--rpm-dir|--update:--rollback-dir|--update:--rpm-keyring|--update:--url|--rollback:--session|--rollback:--url)
+          --build:--srpm|--update:--rpm-dir|--update:--rollback-dir|--update:--rpm-keyring|--update:--url|--update:--site|--rollback:--session|--rollback:--url)
             if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
                 err "У параметра $1 нет значения."
                 return 2
@@ -2214,6 +2282,7 @@ updater_dispatch() {
               --rpm-keyring) keyring="$2" ;;
               --srpm) srpm="$2" ;;
               --url) url="$2" ;;
+              --site) selector="$2" ;;
               --session) session="$2" ;;
             esac
             shift 2 ;;
@@ -2230,6 +2299,14 @@ updater_dispatch() {
                err 'Для обновления без запросов параметры --unattended и --backup-verified нужны вместе.'
                return 2
            fi
+           if [ -n "$selector" ] && [ -n "$url" ]; then
+               err 'Для --update выберите --site или --url, а не оба параметра.'; return 2
+           fi
+           if [ -z "$url" ] || [ "$url" = auto ]; then
+               require_root || return
+               select_managed_site "$selector" "$unattended" || return
+               url=auto
+           fi
            run_update "$(resolve_rpm_dir "$rpmdir")" "$url" "$olddir" "$keyring" "$unattended" ;;
        --rollback)
            if [ -z "$session" ]; then
@@ -2243,7 +2320,7 @@ updater_dispatch() {
 
 # Подменю используют те же команды и проверки, что и запуск с флагами.
 menu_checks() {
-    local choice site
+    local choice
     while :; do
         echo
         status_line info 'Проверки и диагностика'
@@ -2251,7 +2328,7 @@ menu_checks() {
         echo ' 2. Что делать дальше — план обновления'
         echo ' 3. Полный аудит с отчётом без сети'
         echo ' 4. Полный аудит с проверкой PHP.net через интернет'
-        echo ' 5. Проверить PHP сайта по закрытому URL'
+        echo ' 5. Проверить PHP сайта автоматически — временный закрытый тест'
         echo ' 6. Подробная диагностика на экране без сети'
         echo ' 7. Подготовить отдельный Python для полного аудита'
         echo ' 0. Назад'
@@ -2262,14 +2339,7 @@ menu_checks() {
           2) bash "$SELF" --plan ;;
           3) bash "$SELF" --audit --offline ;;
           4) bash "$SELF" --audit ;;
-          5)
-             printf 'Закрытый URL проверки Apache/PHP (Enter — отмена): '
-             IFS= read -r site || return 1
-             if [ -z "$site" ]; then
-                 echo 'Проверка сайта отменена.'
-             else
-                 bash "$SELF" --check --url "$site"
-             fi ;;
+          5) bash "$SELF" --check-site ;;
           6) bash "$SELF" --diagnose --full --offline ;;
           7) bash "$SELF" --bootstrap-python ;;
           0) return 0 ;;
@@ -2281,7 +2351,7 @@ menu_checks() {
 menu_install_rpms() {
     local rpm_path old_path keyring site
     echo 'Установка из заранее подготовленных подписанных комплектов.'
-    echo 'В любом поле Enter отменяет установку.'
+    echo 'Enter в поле каталога или ключа отменяет установку.'
     printf 'Каталог новых RPM: '
     IFS= read -r rpm_path || return 1
     if [ -z "$rpm_path" ]; then echo 'Установка отменена.'; return 0; fi
@@ -2291,10 +2361,13 @@ menu_install_rpms() {
     printf 'Абсолютный путь к доверенному публичному keyring: '
     IFS= read -r keyring || return 1
     if [ -z "$keyring" ]; then echo 'Установка отменена.'; return 0; fi
-    printf 'Закрытый URL проверки Apache/PHP: '
+    printf 'Закрытый URL проверки (Enter — автоматический временный тест): '
     IFS= read -r site || return 1
-    if [ -z "$site" ]; then echo 'Установка отменена.'; return 0; fi
-    bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" --url "$site"
+    if [ -n "$site" ]; then
+        bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" --url "$site"
+    else
+        bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring"
+    fi
     return 0
 }
 
@@ -2397,32 +2470,60 @@ full_menu() {
     done
 }
 
+check_site_dispatch() {
+    local selector='' cli='' unattended=0
+    MANAGED_SITE=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --site)
+                if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+                    err 'Укажите имя сайта или DocumentRoot после --site.'; return 2
+                fi
+                selector="$2"; shift 2 ;;
+            *) err "Параметр $1 недопустим для --check-site."; return 2 ;;
+        esac
+    done
+    require_root || return
+    need php httpd curl || return
+    [ -t 0 ] || unattended=1
+    select_managed_site "$selector" "$unattended" || return
+    cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || { err 'Не удалось определить версию PHP CLI.'; return 63; }
+    http_check auto "$cli"
+}
+
 setup_auto_update() (
-    local config='/etc/bitrix-php-update.conf' keydir='/etc/bitrix-php-update' temp='' config_temp='' health='' cli='' keyfile=''
+    local config='/etc/bitrix-php-update.conf' keydir='/etc/bitrix-php-update' temp='' config_temp='' cli='' keyfile=''
+    local selector='' unattended=0
     local source='https://github.com/vitikevich-landau/bitrix-php82-updater/releases/download/php-8.2.35-el7-r1'
     local key_url='https://raw.githubusercontent.com/vitikevich-landau/bitrix-php82-updater/main/release-keyring.gpg'
     local expected_key='7f07067817dfb211bb503e8f5a8e7c0a4b73d2e26154e9b07091548d1dcfb91c'
     require_root || return
-    [ "$#" -eq 0 ] || { err 'Использование: bash install.sh --setup-update'; return 2; }
-    [ -t 0 ] || { err 'Первичная настройка требует терминала. Запустите bash install.sh --setup-update.'; return 12; }
+    MANAGED_SITE=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --site)
+                if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+                    err 'Укажите имя сайта или DocumentRoot после --site.'; return 2
+                fi
+                selector="$2"; shift 2 ;;
+            --unattended) unattended=1; shift ;;
+            *) err "Параметр $1 недопустим для --setup-update."; return 2 ;;
+        esac
+    done
+    [ -t 0 ] || unattended=1
     profile_check || return
     need curl sha256sum mktemp mv chmod gpgv dirname || return
     if [ -e "$config" ] || [ -L "$config" ]; then
         load_auto_config "$config" || return
-        health="$AUTO_HEALTH_URL"
+        if [ "$unattended" = 1 ]; then selector="${selector:-$AUTO_SITE}"; fi
     fi
     echo 'Настройка подключает общий выпуск проекта и его закреплённый ключ.'
     printf 'Источник комплектов — %s\n' "$source"
-    echo 'Нужен закрытый URL проверки веб-PHP на этом сервере. Подготовка описана в README.'
-    printf 'URL проверки%s: ' "${health:+ [$health]}"
-    local entered=''
-    IFS= read -r entered || return 12
-    health="${entered:-$health}"
-    health_url_parts "$health" >/dev/null || return
+    select_managed_site "$selector" "$unattended" || return
+    health_target_validate auto || return
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || return 61
-    http_check "$health" "$cli" || { err 'Сначала настройте закрытый веб-тест и повторите настройку.'; return 61; }
+    http_check auto "$cli" || { err 'Автоматическая проверка сайта не пройдена. Настройки не сохранены.'; return 61; }
     printf 'Проверка сайта пройдена для PHP %s.\n' "$cli"
-    confirm_phrase 'Сохранить источник пакетов, публичный ключ проверки и URL сайта?' 'СОХРАНИТЬ НАСТРОЙКИ' || return
     if [ -e "$keydir" ] || [ -L "$keydir" ]; then
         private_session_dir "$keydir" || { err 'Каталог /etc/bitrix-php-update должен принадлежать root с правами 0700.'; return 61; }
     else
@@ -2445,10 +2546,571 @@ setup_auto_update() (
         mv -- "$temp/release-keyring.gpg" "$keyfile" || return
     fi
     config_temp="$(mktemp "$(dirname -- "$config")/.bitrix-php-update.XXXXXXXX")" || return
-    printf 'SOURCE=%s\nKEYRING=%s\nHEALTH_URL=%s\n' "$source" "$keyfile" "$health" > "$config_temp" || return
+    printf 'SOURCE=%s\nKEYRING=%s\nHEALTH_URL=auto\nSITE=%s\n' "$source" "$keyfile" "$MANAGED_SITE" > "$config_temp" || return
     chmod 0600 -- "$config_temp" || return
     mv -f -- "$config_temp" "$config" || return
     msg 'Настройки сохранены. Для обновления запустите bash install.sh --auto-update.'
+)
+
+# Список строится из активного дерева Apache, а не из glob всех *.conf.
+MANAGED_SITE_CANDIDATES=()
+MANAGED_SITE_LABELS=()
+MANAGED_SITE_ALIASES=()
+MANAGED_SITE=''
+
+_managed_site_validate_httpd_args() {
+    local value
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -DFOREGROUND|-kstart) shift ;;
+            -D)
+                [ "$#" -ge 2 ] && [ "$2" = FOREGROUND ] || return 83
+                shift 2 ;;
+            -k)
+                [ "$#" -ge 2 ] && [ "$2" = start ] || return 83
+                shift 2 ;;
+            -f|-d)
+                [ "$#" -ge 2 ] || return 83
+                value="$2"
+                if [ "$1" = -f ]; then
+                    [[ "$value" = /etc/httpd/conf/httpd.conf || "$value" = conf/httpd.conf || "$value" = ./conf/httpd.conf ]] || return 83
+                else
+                    [[ "$value" = /etc/httpd || "$value" = /etc/httpd/ ]] || return 83
+                fi
+                shift 2 ;;
+            -f*)
+                value="${1#-f}"
+                [[ "$value" = /etc/httpd/conf/httpd.conf || "$value" = conf/httpd.conf || "$value" = ./conf/httpd.conf ]] || return 83
+                shift ;;
+            -d*)
+                value="${1#-d}"
+                [[ "$value" = /etc/httpd || "$value" = /etc/httpd/ ]] || return 83
+                shift ;;
+            *) return 83 ;;
+        esac
+    done
+}
+
+_managed_site_check_running() {
+    local pidfile='' trusted pid executable arg
+    local -a argv=()
+    for pidfile in /run/httpd/httpd.pid /var/run/httpd/httpd.pid; do
+        if [ -e "$pidfile" ] || [ -L "$pidfile" ]; then break; fi
+        pidfile=''
+    done
+    [ -n "$pidfile" ] || return 0
+    if ! declare -F trusted_rpm_keyring >/dev/null ||
+       ! trusted="$(trusted_rpm_keyring "$pidfile")" ||
+       [ "$(stat -c %s -- "$trusted")" -gt 32 ]; then
+        err 'Не удалось проверить защищённый PID-файл Apache.'; return 83
+    fi
+    pid="$(cat -- "$trusted")" || return 83
+    [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || { err 'Некорректный PID Apache.'; return 83; }
+    [ -d "/proc/$pid" ] || return 0
+    executable="$(readlink -- "/proc/$pid/exe" 2>/dev/null)" || return 0
+    executable="${executable% (deleted)}"
+    # PID мог устареть и уже принадлежать другому процессу.
+    [ "${executable##*/}" = httpd ] || return 0
+    if [ ! -r "/proc/$pid/cmdline" ]; then err 'Недоступны аргументы работающего Apache.'; return 83; fi
+    while IFS= read -r -d '' arg; do argv+=("$arg"); done < "/proc/$pid/cmdline"
+    [ "${#argv[@]}" -gt 0 ] || { err 'Не удалось проверить запуск Apache.'; return 83; }
+    if ! _managed_site_validate_httpd_args "${argv[@]:1}"; then
+        err 'Apache запущен с нестандартными параметрами конфигурации. Автоматический поиск сайтов остановлен; используйте явно настроенный URL проверки.'
+        return 83
+    fi
+}
+
+_managed_site_dump_records() (
+    local temp modules module bytes
+    local -a extra=()
+    require_root || return
+    need httpd awk mktemp rm stat grep readlink cat || return
+    _managed_site_check_running || return
+    umask 077
+    export LC_ALL=C
+    temp="$(mktemp -d /tmp/bitrix-sites.XXXXXXXX)" || return 83
+    trap 'rm -rf -- "$temp"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    modules="$(httpd -M 2> "$temp/modules-error")" || {
+        err 'Apache не смог прочитать конфигурацию. Сначала исправьте ошибки httpd -t.'; return 83;
+    }
+    if ! grep -Eq '^[[:space:]]*info_module \((shared|static)\)[[:space:]]*$' <<< "$modules"; then
+        # Модуль загружается только в отдельный процесс проверки конфигурации.
+        # Рабочая служба и её файлы конфигурации не меняются.
+        if ! declare -F trusted_rpm_keyring >/dev/null ||
+           ! module="$(trusted_rpm_keyring /usr/lib64/httpd/modules/mod_info.so)"; then
+            err 'Для поиска сайтов нужен доверенный модуль mod_info Apache.'; return 83
+        fi
+        extra=(-C "LoadModule info_module $module")
+    fi
+    if ! httpd -t -D DUMP_CONFIG "${extra[@]}" > "$temp/config" 2> "$temp/config-error"; then
+        err 'Apache не смог разобрать конфигурацию сайтов. Выполните httpd -t.'; return 83
+    fi
+    bytes="$(stat -c %s -- "$temp/config")" || return 83
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]] || [ "$bytes" -eq 0 ] || [ "$bytes" -gt 16777216 ]; then
+        err 'Не получен ограниченный дамп активной конфигурации Apache.'; return 83
+    fi
+    # mod_info уже раскрыл Include/IfModule/IfDefine. Неизвестные способы
+    # задания корня сайта не интерпретируем как shell/PHP-код.
+    if ! awk '
+      function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+      function scalar(s) {
+        s=trim(s)
+        if (s ~ /^"[^"\\]*"$/ || s ~ /^\047[^\047\\]*\047$/) return substr(s,2,length(s)-2)
+        if (s !~ /[[:space:]"\\\047]/) return s
+        return ""
+      }
+      function hostname(s, a,n,i) {
+        s=tolower(s)
+        sub(/^https?:\/\//,"",s)
+        sub(/:[0-9]+$/,"",s)
+        if (s=="127.0.0.1") return s
+        if (length(s)<1 || length(s)>253 || s !~ /^[a-z0-9.-]+$/ || s !~ /[a-z]/) return ""
+        n=split(s,a,".")
+        for(i=1;i<=n;i++) if (length(a[i])<1 || length(a[i])>63 || a[i] !~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/) return ""
+        if(a[n] !~ /^[a-z]/) return ""
+        return s
+      }
+      function endpoint(s, a,n,p) {
+        if (s ~ /^[0-9]+$/) p=s
+        else {
+          n=split(s,a,":")
+          if(n!=2 || a[1] !~ /^(127\.0\.0\.1|0\.0\.0\.0|localhost|\*|_default_)$/) return ""
+          p=a[2]
+        }
+        if(p !~ /^[1-9][0-9]*$/ || length(p)>5 || p+0>65535) return ""
+        return p+0
+      }
+      function emit(v,p, h,r,ssl,k,alias,seenAlias,a,n,i) {
+        if(bad[v] || bad[0]) return
+        h=names[v]; if(h=="") h=names[0]; if(h=="") h="127.0.0.1"
+        h=hostname(h); if(h=="") return
+        r=roots[v]; if(r=="") r=roots[0]
+        if(r !~ /^\// || r=="/" || r ~ /[|[:cntrl:]]/ || length(r)>4096) return
+        ssl=ssls[v]; if(ssl=="") ssl=ssls[0]
+        if(ssl!="on" && ssl!="off") return
+        k=h ":" p
+        if(used[k]++) { fatal=1; return }
+        alias=""; seenAlias=" " h " "
+        n=split(aliases[v],a," ")
+        for(i=1;i<=n;i++) {
+          a[i]=hostname(a[i])
+          if(a[i]!="" && index(seenAlias," " a[i] " ")==0) { alias=alias (alias==""?"":" ") a[i]; seenAlias=seenAlias a[i] " " }
+        }
+        if(++count>512) { fatal=1; return }
+        print (ssl=="on"?"https":"http") "|" h "|" p "|" r "|" alias
+      }
+      BEGIN { depth=0; v=0; total=0; ssls[0]="off" }
+      {
+        line=trim($0)
+        if(line=="" || line ~ /^#/) next
+        if(line ~ /[[:cntrl:]]/ && line !~ /\t/) { fatal=1; next }
+        if(line ~ /^<\//) {
+          tag=tolower(line); sub(/^<\//,"",tag); sub(/>$/,"",tag); tag=trim(tag)
+          if(depth<1 || stack[depth]!=tag) { fatal=1; next }
+          if(tag=="virtualhost") v=0
+          delete stack[depth--]; next
+        }
+        if(line ~ /^</) {
+          if(!match(line,/^<([^[:space:]>]+)([[:space:]]+.*)?>$/,m)) { fatal=1; next }
+          tag=tolower(m[1]); args=substr(line,length(m[1])+2); sub(/>$/,"",args); args=trim(args)
+          if(tag=="virtualhost") {
+            if(depth!=0 || ++total>512) { fatal=1; next }
+            v=total
+            n=split(args,a,/[[:space:]]+/)
+            if(n>64) { bad[v]=1; next }
+            for(i=1;i<=n;i++) { p=endpoint(a[i]); if(p!="") ports[v SUBSEP p]=1 }
+          }
+          stack[++depth]=tag; next
+        }
+        key=line; sub(/[[:space:]].*$/,"",key); args=trim(substr(line,length(key)+1)); key=tolower(key)
+        direct=(depth==0 || (v>0 && depth==1 && stack[1]=="virtualhost"))
+        if(key=="virtualdocumentroot" || key=="virtualdocumentrootip") { bad[v]=1; next }
+        if(key=="listen") {
+          if(depth!=0) { fatal=1; next }
+          n=split(args,a,/[[:space:]]+/)
+          if(n>2 || (n==2 && a[2]!="http" && a[2]!="https")) next
+          p=endpoint(a[1]); if(p!="") listens[p]=1
+          next
+        }
+        if(key=="documentroot" || key=="servername" || key=="sslengine") {
+          if(!direct) { bad[v]=1; next }
+          value=scalar(args)
+          if(value=="" || value ~ /[|[:cntrl:]]/) { bad[v]=1; next }
+          if(key=="documentroot") roots[v]=value
+          else if(key=="servername") names[v]=value
+          else { value=tolower(value); if(value!="on" && value!="off") bad[v]=1; else ssls[v]=value }
+          next
+        }
+        if(key=="serveralias" && v>0 && direct) {
+          n=split(args,a,/[[:space:]]+/)
+          if(n>64) { bad[v]=1; next }
+          for(i=1;i<=n;i++) { value=scalar(a[i]); if(value !~ /[*?]/) aliases[v]=aliases[v] " " value }
+        }
+      }
+      END {
+        if(depth!=0 || fatal) exit 83
+        nports=asorti(listens,orderedports,"@ind_num_asc")
+        if(total==0) for(pi=1;pi<=nports;pi++) emit(0,orderedports[pi])
+        else for(v=1;v<=total;v++) for(pi=1;pi<=nports;pi++)
+          if((v SUBSEP orderedports[pi]) in ports) emit(v,orderedports[pi])
+        if(count==0 || fatal) exit 83
+      }
+    ' "$temp/config"; then
+        err 'Не удалось однозначно найти сайты Apache с локальным IPv4-доступом. Проверьте DocumentRoot, Listen и виртуальные хосты.'
+        return 83
+    fi
+)
+
+discover_managed_sites() {
+    local records scheme host port root aliases canonical record label
+    MANAGED_SITE_CANDIDATES=() MANAGED_SITE_LABELS=() MANAGED_SITE_ALIASES=()
+    records="$(_managed_site_dump_records)" || return
+    while IFS='|' read -r scheme host port root aliases; do
+        [ -n "$scheme" ] || continue
+        canonical="$(readlink -e -- "$root" 2>/dev/null)" || {
+            err 'Один из корневых каталогов Apache недоступен. Автоматический выбор сайта отменён.'
+            MANAGED_SITE_CANDIDATES=() MANAGED_SITE_LABELS=() MANAGED_SITE_ALIASES=(); return 83
+        }
+        if ! [[ -d "$canonical" && "$canonical" == /* && "$canonical" != / && "$canonical" != *'|'* && ! "$canonical" =~ [[:cntrl:]] ]]; then
+            err 'Корневой каталог сайта не подходит для временной проверки.'
+            MANAGED_SITE_CANDIDATES=() MANAGED_SITE_LABELS=() MANAGED_SITE_ALIASES=(); return 83
+        fi
+        record="$scheme|$host|$port|$canonical"
+        label="$host:$port — $canonical"
+        [ -z "$aliases" ] || label="$label (алиасы: $aliases)"
+        MANAGED_SITE_CANDIDATES+=("$record") MANAGED_SITE_LABELS+=("$label") MANAGED_SITE_ALIASES+=("$aliases")
+    done <<< "$records"
+    [ "${#MANAGED_SITE_CANDIDATES[@]}" -gt 0 ] || { err 'Подходящие сайты не обнаружены.'; return 83; }
+}
+
+select_managed_site() {
+    local selector="${1:-}" unattended="${2:-0}" i record scheme host port root choice pick
+    local -a matches=()
+    MANAGED_SITE=''
+    [[ "$unattended" = 0 || "$unattended" = 1 ]] || return 2
+    discover_managed_sites || return
+    if [[ "$selector" == /* && -d "$selector" ]]; then selector="$(readlink -e -- "$selector")" || return 83; fi
+    for i in "${!MANAGED_SITE_CANDIDATES[@]}"; do
+        record="${MANAGED_SITE_CANDIDATES[$i]}"
+        IFS='|' read -r scheme host port root <<< "$record"
+        if [ -z "$selector" ] || [ "$selector" = "$record" ] || [ "$selector" = "$root" ] ||
+           [ "${selector,,}" = "$host" ] || [[ " ${MANAGED_SITE_ALIASES[$i]} " == *" ${selector,,} "* ]]; then
+            matches+=("$i")
+        fi
+    done
+    if [ "${#matches[@]}" -eq 0 ]; then err 'Выбранный сайт не найден в активной конфигурации Apache. Повторите выбор сайта.'; return 83; fi
+    if [ "${#matches[@]}" -eq 1 ]; then
+        MANAGED_SITE="${MANAGED_SITE_CANDIDATES[${matches[0]}]}"
+        return 0
+    fi
+    if [ "$unattended" = 1 ] || [ ! -t 0 ]; then
+        err 'Найдено несколько сайтов. Укажите --site с доменом, корневым каталогом или точной записью сайта; либо запустите выбор в терминале.'
+        return 83
+    fi
+    echo 'Выберите сайт для временной проверки PHP:'
+    for i in "${!matches[@]}"; do printf '  %s) %s\n' "$((i+1))" "${MANAGED_SITE_LABELS[${matches[$i]}]}"; done
+    printf 'Номер сайта (пустой ввод — отмена): '
+    IFS= read -r choice || return 12
+    [ -n "$choice" ] || return 12
+    if ! [[ "$choice" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$choice" -gt "${#matches[@]}" ]; then err 'Неверный номер сайта. Повторите команду и выберите пункт из списка.'; return 83; fi
+    pick="${matches[$((10#$choice-1))]}"
+    MANAGED_SITE="${MANAGED_SITE_CANDIDATES[$pick]}"
+}
+
+# Managed probes are scoped to one HTTP check. Never import state from the environment.
+MANAGED_SITE=''
+
+validate_managed_site() {
+    local record="$1" scheme host port root extra
+    [[ -n "$record" && "${#record}" -le 4095 && ! "$record" =~ [[:cntrl:]] ]] || return 85
+    IFS='|' read -r scheme host port root extra <<< "$record"
+    [[ "$record" = "$scheme|$host|$port|$root" && "$scheme" =~ ^https?$ &&
+       "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 &&
+       "$root" = /* && "$root" != / && "$root" != */ && "$root" != *//* &&
+       "$root" != */./* && "$root" != */../* && "$root" != */. && "$root" != */.. ]] || return 85
+    health_url_parts "$scheme://$host:$port/bitrix-master-probe.php" >/dev/null || return 85
+}
+
+managed_site_save() (
+    local path="$1" parent temp=''
+    validate_managed_site "$MANAGED_SITE" || { err 'Некорректное описание выбранного сайта.'; return 85; }
+    [[ "$path" = /* && ! -L "$path" ]] || return 85
+    if [ -e "$path" ]; then private_session_file "$path" || return 85; fi
+    parent="$(dirname -- "$path")" || return 85
+    temp="$(mktemp "$parent/.managed-site.XXXXXXXX")" || return 85
+    trap '[ -z "$temp" ] || rm -f -- "$temp"' EXIT
+    printf '%s\n' "$MANAGED_SITE" > "$temp" && chmod 0600 -- "$temp" || return 85
+    trusted_rpm_keyring "$temp" >/dev/null || return 85
+    mv -T -- "$temp" "$path" || return 85
+)
+
+managed_site_load() {
+    local path="$1" record
+    private_session_file "$path" && trusted_rpm_keyring "$path" >/dev/null || return 85
+    [ "$(stat -c %s -- "$path")" -le 4096 ] && awk 'END {exit NR != 1}' "$path" || return 85
+    record="$(cat -- "$path")" && validate_managed_site "$record" || return 85
+    MANAGED_SITE="$record"
+}
+
+managed_probe_record() (
+    local path="$1" value="$2" temp
+    temp="$(mktemp "$(dirname -- "$path")/.record.XXXXXXXX")" || return 85
+    trap 'rm -f -- "$temp"' EXIT
+    printf '%s\n' "$value" > "$temp" && chmod 0600 -- "$temp" && mv -T -- "$temp" "$path"
+)
+
+managed_probe_read_record() {
+    local path="$1" value
+    private_session_file "$path" && [ "$(stat -c %s -- "$path")" -le 4096 ] || return 85
+    awk 'END {exit NR != 1}' "$path" || return 85
+    value="$(cat -- "$path")" || return 85
+    [[ -n "$value" && ! "$value" =~ [[:cntrl:]] ]] || return 85
+    printf '%s\n' "$value"
+}
+
+# Caller holds the lease lock. Open directory descriptors anchor cleanup even if
+# a site owner renames the document root or the temporary directory meanwhile.
+managed_probe_cleanup_one() (
+    local lease="$1" parent_anchor="${2:-}" directory_anchor="${3:-}" MANAGED_SITE=''
+    local scheme host port root name parent_id expected_id expected_hash actual file parent_fd='' directory_fd=''
+    private_session_dir "$lease" && managed_site_load "$lease/site" || return 85
+    IFS='|' read -r scheme host port root <<< "$MANAGED_SITE"
+    name="$(managed_probe_read_record "$lease/name")" && [[ "$name" =~ ^bitrix-master-probe-[a-f0-9]{32}$ ]] || return 85
+    parent_id="$(managed_probe_read_record "$lease/parent.id")" && [[ "$parent_id" =~ ^[0-9]+:[0-9]+$ ]] || return 85
+    expected_hash="$(managed_probe_read_record "$lease/sha256")" && [[ "$expected_hash" =~ ^[a-f0-9]{64}$ ]] || return 85
+    if [ -z "$parent_anchor" ]; then
+        [[ -d "$root" && ! -L "$root" && "$(readlink -e -- "$root")" = "$root" ]] || return 85
+        exec {parent_fd}< "$root" || return 85
+        parent_anchor="/proc/$BASHPID/fd/$parent_fd"
+    fi
+    [ "$(stat -Lc '%d:%i' -- "$parent_anchor")" = "$parent_id" ] || return 85
+    if [ -z "$directory_anchor" ]; then
+        if [ ! -e "$parent_anchor/$name" ] && [ ! -L "$parent_anchor/$name" ]; then
+            directory_anchor=''
+        else
+            [[ -d "$parent_anchor/$name" && ! -L "$parent_anchor/$name" ]] || return 85
+            exec {directory_fd}< "$parent_anchor/$name" || return 85
+            directory_anchor="/proc/$BASHPID/fd/$directory_fd"
+        fi
+    fi
+    if [ -n "$directory_anchor" ]; then
+        actual="$(stat -Lc '%u:%a:%h' -- "$directory_anchor")" || return 85
+        [[ "$actual" =~ ^0:(700|755):(1|2)$ ]] || return 85
+        # A failed mkdir may have collided with another directory. An unclaimed
+        # empty directory is safer to leave than to infer ownership from its name.
+        expected_id="$(managed_probe_read_record "$lease/directory.id")" && [[ "$expected_id" =~ ^[0-9]+:[0-9]+$ ]] || return 85
+        [ "$(stat -Lc '%d:%i' -- "$directory_anchor")" = "$expected_id" ] || return 85
+        file="$directory_anchor/probe.php"
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            [[ -f "$file" && ! -L "$file" ]] || return 85
+            actual="$(stat -c '%u:%a:%h' -- "$file")" || return 85
+            [[ "$actual" = 0:600:1 || "$actual" = 0:644:1 ]] || return 85
+            if [ -e "$lease/file.id" ]; then
+                expected_id="$(managed_probe_read_record "$lease/file.id")" && [[ "$expected_id" =~ ^[0-9]+:[0-9]+$ ]] || return 85
+                [ "$(stat -c '%d:%i' -- "$file")" = "$expected_id" ] || return 85
+            fi
+            actual="$(sha256sum -- "$file")" || return 85
+            [ "${actual%% *}" = "$expected_hash" ] || return 85
+            rm -f -- "$file" || return 85
+        fi
+        # Do not recursively delete directories or follow a replacement symlink.
+        [[ -d "$parent_anchor/$name" && ! -L "$parent_anchor/$name" ]] || return 85
+        [ "$(stat -Lc '%d:%i' -- "$parent_anchor/$name")" = "$(stat -Lc '%d:%i' -- "$directory_anchor")" ] || return 85
+        rmdir -- "$parent_anchor/$name" || return 85
+    fi
+    for name in site name parent.id directory.id file.id sha256 payload.php curl.conf active.lock response; do
+        if [ -e "$lease/$name" ] || [ -L "$lease/$name" ]; then
+            private_session_file "$lease/$name" || return 85
+            rm -f -- "$lease/$name" || return 85
+        fi
+    done
+    # Interrupted atomic metadata writes are private, regular files only.
+    for file in "$lease"/.record.*; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        private_session_file "$file" || return 85
+        rm -f -- "$file" || return 85
+    done
+    rmdir -- "$lease" || return 85
+)
+
+managed_probe_cleanup_stale() (
+    local state="$UPDATER_STATE/probes" lease name lock_fd rc=0
+    require_root || return
+    if [ ! -e "$state" ] && [ ! -L "$state" ]; then return 0; fi
+    private_session_dir "$UPDATER_STATE" && private_session_dir "$state" || return 85
+    need flock stat readlink sha256sum awk || return 85
+    for lease in "$state"/*; do
+        [ -e "$lease" ] || [ -L "$lease" ] || continue
+        name="${lease##*/}"
+        if ! [[ "$name" =~ ^[a-f0-9]{32}$ ]] || ! private_session_dir "$lease" || ! private_session_file "$lease/active.lock"; then
+            err 'Небезопасная запись временной веб-проверки. Автоматическая очистка остановлена.'
+            rc=85; continue
+        fi
+        exec {lock_fd}< "$lease/active.lock" || { rc=85; continue; }
+        if flock -n "$lock_fd"; then
+            if ! managed_probe_cleanup_one "$lease"; then
+                err "Временная веб-проверка изменена или недоступна; файлы сохранены для проверки: $lease"
+                rc=85
+            fi
+        fi
+        exec {lock_fd}<&-
+    done
+    return "$rc"
+)
+
+managed_http_check() (
+    local expected="$1" scheme host port root state lease='' stage='' parent_fd='' directory_fd='' lease_fd=''
+    local parent_anchor='' directory_anchor='' token nonce token_hash expiry name url result expected_hash
+    local directory_metadata directory_identity parent_real directory_real selinux_status=1
+    local -a directory_entries=()
+    # Bash locals inherit export attributes from same-named caller variables.
+    # Keep generated credentials out of child environments as well as argv.
+    export -n token token_hash
+    require_root || return
+    validate_managed_site "$MANAGED_SITE" && [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        err 'Не задан выбранный сайт или ожидаемая версия PHP.'; return 85;
+    }
+    need curl head cmp mktemp stat readlink sha256sum od tr flock mkdir rmdir rm chmod cp date awk || return 85
+    ensure_session_dir "$UPDATER_STATE" || return 85
+    state="$UPDATER_STATE/probes"
+    ensure_session_dir "$state" && managed_probe_cleanup_stale || return 85
+    IFS='|' read -r scheme host port root <<< "$MANAGED_SITE"
+    [[ -d "$root" && ! -L "$root" && "$(readlink -e -- "$root")" = "$root" ]] || {
+        err 'Каталог выбранного сайта изменился или недоступен.'; return 85;
+    }
+    managed_probe_exit() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        if [ -n "$lease" ]; then
+            if ! managed_probe_cleanup_one "$lease" "$parent_anchor" "$directory_anchor"; then
+                err "Не удалось безопасно удалить временную веб-проверку. Проверьте запись $lease"
+                [ "$status" -ne 0 ] || status=85
+            fi
+        elif [ -n "$stage" ] && private_session_dir "$stage"; then
+            # This is a private staging directory; no web file exists yet.
+            rm -rf -- "$stage" || { [ "$status" -ne 0 ] || status=85; }
+        fi
+        exit "$status"
+    }
+    trap managed_probe_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    exec {parent_fd}< "$root" || return 85
+    parent_anchor="/proc/$BASHPID/fd/$parent_fd"
+    token="$(od -v -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || return 85
+    nonce="$(od -v -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || return 85
+    [[ "$token" =~ ^[a-f0-9]{64}$ && "$nonce" =~ ^[a-f0-9]{32}$ ]] || return 85
+    token_hash="$(printf '%s' "$token" | sha256sum)" || return 85
+    token_hash="${token_hash%% *}"
+    expiry=$(( $(date +%s) + 180 ))
+    name="bitrix-master-probe-$nonce"
+    url="$scheme://$host:$port/$name/probe.php"
+    stage="$(mktemp -d "$state/.stage.XXXXXXXX")" || return 85
+    exec {lease_fd}> "$stage/active.lock" || return 85
+    flock -n "$lease_fd" || return 85
+    managed_site_save "$stage/site" || return 85
+    managed_probe_record "$stage/name" "$name" &&
+    managed_probe_record "$stage/parent.id" "$(stat -Lc '%d:%i' -- "$parent_anchor")" || return 85
+    cat > "$stage/payload.php" <<PHP
+<?php
+header('Content-Type: text/plain; charset=UTF-8');
+header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+\$peer = isset(\$_SERVER['REMOTE_ADDR']) ? \$_SERVER['REMOTE_ADDR'] : '';
+\$method = isset(\$_SERVER['REQUEST_METHOD']) ? \$_SERVER['REQUEST_METHOD'] : '';
+\$secret = isset(\$_SERVER['HTTP_X_BITRIX_MASTER_PROBE']) ? \$_SERVER['HTTP_X_BITRIX_MASTER_PROBE'] : '';
+\$allowed = (\$peer === '127.0.0.1' || \$peer === '::1') && \$method === 'GET' && time() <= $expiry;
+if (!\$allowed || !is_string(\$secret) || !preg_match('/^[a-f0-9]{64}\$/D', \$secret) || !function_exists('hash')) {
+    header('HTTP/1.1 404 Not Found'); exit;
+}
+\$actual = hash('sha256', \$secret);
+\$known = '$token_hash';
+\$difference = 0;
+for (\$i = 0; \$i < 64; \$i++) { \$difference |= ord(\$actual[\$i]) ^ ord(\$known[\$i]); }
+if (\$difference !== 0) { header('HTTP/1.1 404 Not Found'); exit; }
+if (PHP_SAPI !== 'apache2handler' || !function_exists('mb_substr') || !extension_loaded('mysqli')) {
+    header('HTTP/1.1 503 Service Unavailable'); exit;
+}
+echo 'BITRIX_MASTER_OK ' . PHP_VERSION . " apache2handler $nonce\n";
+PHP
+    [ "$?" -eq 0 ] || return 85
+    expected_hash="$(sha256sum -- "$stage/payload.php")" || return 85
+    managed_probe_record "$stage/sha256" "${expected_hash%% *}" || return 85
+    printf 'header = "X-Bitrix-Master-Probe: %s"\n' "$token" > "$stage/curl.conf" || return 85
+    chmod 0600 -- "$stage/payload.php" "$stage/curl.conf" "$stage/active.lock" || return 85
+    [ ! -e "$state/$nonce" ] && [ ! -L "$state/$nonce" ] || return 85
+    mv -T -- "$stage" "$state/$nonce" || return 85
+    lease="$state/$nonce"; stage=''
+    # The parent belongs to the site owner, who can replace a directory entry
+    # after mkdir. Never open, populate, or chmod a replacement blindly.
+    # Root0755 is safe from creation: credentials stay in the private lease and
+    # probe.php is O_EXCL-created at0600 until its complete guard is ready.
+    mkdir -m 0755 -- "$parent_anchor/$name" || return 85
+    directory_metadata="$(stat -c '%F:%u:%a:%d:%i' -- "$parent_anchor/$name")" || return 85
+    [[ "$directory_metadata" =~ ^directory:0:755:([0-9]+:[0-9]+)$ ]] || {
+        err 'Каталог временной проверки подменён; запись файлов отменена.'; return 85;
+    }
+    directory_identity="${BASH_REMATCH[1]}"
+    exec {directory_fd}< "$parent_anchor/$name" || return 85
+    directory_anchor="/proc/$BASHPID/fd/$directory_fd"
+    [[ ! -L "$parent_anchor/$name" &&
+       "$(stat -c '%F:%u:%a:%d:%i' -- "$parent_anchor/$name")" = "$directory_metadata" &&
+       "$(stat -Lc '%F:%u:%a:%d:%i' -- "$directory_anchor")" = "$directory_metadata" ]] || {
+        err 'Каталог временной проверки изменился при открытии; запись файлов отменена.'; return 85;
+    }
+    parent_real="$(readlink -e -- "$parent_anchor")" && directory_real="$(readlink -e -- "$directory_anchor")" || return 85
+    [ "$directory_real" = "$parent_real/$name" ] || {
+        err 'Временный каталог оказался вне выбранного пути сайта.'; return 85;
+    }
+    shopt -s nullglob dotglob
+    directory_entries=("$directory_anchor"/*)
+    [ "${#directory_entries[@]}" -eq 0 ] || {
+        err 'Временный каталог уже содержит чужие файлы; запись отменена.'; return 85;
+    }
+    managed_probe_record "$lease/directory.id" "$directory_identity" || return 85
+    (set -o noclobber; cat -- "$lease/payload.php" > "$directory_anchor/probe.php") || return 85
+    managed_probe_record "$lease/file.id" "$(stat -c '%d:%i' -- "$directory_anchor/probe.php")" || return 85
+    chmod 0644 -- "$directory_anchor/probe.php" || return 85
+    if command -v selinuxenabled >/dev/null 2>&1; then
+        selinux_status=0
+        selinuxenabled || selinux_status=$?
+        [[ "$selinux_status" = 0 || "$selinux_status" = 1 ]] || {
+            err 'Не удалось определить состояние SELinux.'; return 85;
+        }
+    elif [ -e /sys/fs/selinux/enforce ]; then
+        selinux_status=0
+    fi
+    if [ "$selinux_status" = 0 ]; then
+        need chcon || return 85
+        # Anchor both reference and targets; never relabel a replaced web path.
+        chcon --reference="$parent_anchor/." -- "$directory_anchor/." "$directory_anchor/probe.php" >/dev/null 2>&1 || {
+            err 'Не удалось подготовить SELinux-контекст временной проверки.'; return 85;
+        }
+    fi
+    for result in negative authenticated negative; do
+        local curl_options=()
+        [ "$result" != authenticated ] || curl_options=(--config "$lease/curl.conf")
+        if ! curl -q "${curl_options[@]}" --silent --show-error --globoff --proto '=http,https' \
+                  --connect-timeout 5 --max-time 20 --noproxy '*' --resolve "$host:$port:127.0.0.1" \
+                  --max-filesize 4096 --write-out '\n%{http_code}\n%{remote_ip}\n%{remote_port}\n' \
+                  -- "$url" | head -c 4096 > "$lease/response"; then
+            err 'Не удалось выполнить временную локальную HTTP-проверку.'; return 85
+        fi
+        if [ "$result" = authenticated ]; then
+            cmp -s "$lease/response" <(printf 'BITRIX_MASTER_OK %s apache2handler %s\n\n200\n127.0.0.1\n%s\n' "$expected" "$nonce" "$port") || {
+                err 'Временная проверка не подтвердила версию PHP, mod_php и необходимые расширения.'; return 85;
+            }
+        else
+            cmp -s "$lease/response" <(printf '\n404\n127.0.0.1\n%s\n' "$port") || {
+                err 'Временная проверка не закрыта для запроса без секретного ключа; обновление запрещено.'; return 85;
+            }
+        fi
+    done
+    printf 'Веб-PHP %s (apache2handler) подтверждён для %s. Временная проверка закрыта и будет удалена.\n' "$expected" "$host"
 )
 
 # Мутирующие операции: отдельный обработчик Bash, без зависимости от Python.
@@ -2472,6 +3134,11 @@ case "${1:-}" in
   --check)
       shift
       quick_check "$@"
+      exit $?
+      ;;
+  --check-site)
+      shift
+      check_site_dispatch "$@"
       exit $?
       ;;
   --plan|--build|--update|--rollback|--status)
@@ -2551,7 +3218,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = '1.0.0-rc8'
+VERSION = '1.0.0-rc9'
 PHP_EOL = {'5.6': '2018-12-31', '7.0': '2019-01-10', '7.1': '2019-12-01',
            '7.2': '2020-11-30', '7.3': '2021-12-06', '7.4': '2022-11-28',
            '8.0': '2023-11-26', '8.1': '2025-12-31', '8.2': '2026-12-31',

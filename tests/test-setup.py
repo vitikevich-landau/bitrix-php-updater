@@ -1,18 +1,17 @@
-"""Setup tests in isolated /root directories; downloads and website are mocked.
+"""Noninteractive setup tests in isolated /root directories.
 
-Only the copied test function uses a fixture key hash. No release key is read.
+Discovery, downloads and the HTTP probe are boundary doubles. Only the copied
+test function uses a fixture key hash. No release key is read.
 """
 import hashlib
 import os
+import pty
 import re
 import sys
 from pathlib import Path
-import pty
-import select
 import stat
 import subprocess
 import tempfile
-import time
 
 installer = Path(sys.argv[1]).resolve(strict=True).read_text(encoding='utf-8')
 marker = '# Мутирующие операции:'
@@ -26,8 +25,11 @@ fixture_key = b'isolated setup key fixture; never a real signing key\n'
 key_hash = hashlib.sha256(fixture_key).hexdigest()
 prefix = prefix.replace("expected_key='" + original_key_hash + "'", "expected_key='" + key_hash + "'", 1)
 failures = 0
-for scenario in ('fresh', 'existing_custom_source', 'wrong_key_preserves', 'failed_health',
-                 'cancel', 'unsafe_config', 'unsafe_keydir', 'symlink_config', 'symlink_keydir',
+site_record = 'http|site.example|80|/var/www/site'
+other_record = 'http|other.example|80|/var/www/other'
+for scenario in ('fresh', 'explicit_site', 'existing_saved_site', 'interactive_existing_site', 'existing_custom_source',
+                 'wrong_key_preserves', 'failed_health', 'ambiguous_sites', 'selection_cancelled',
+                 'unsafe_config', 'unsafe_keydir', 'symlink_config', 'symlink_keydir',
                  'failed_save_preserves_pair', 'reuse_pinned_key', 'unsafe_pinned_key', 'corrupt_pinned_key'):
     with tempfile.TemporaryDirectory(dir='/root') as directory:
         home = Path(directory)
@@ -35,12 +37,14 @@ for scenario in ('fresh', 'existing_custom_source', 'wrong_key_preserves', 'fail
         keydir = home/'keys'
         oldkey = keydir/'release-keyring.gpg'
         original = None
-        if scenario in ('existing_custom_source','wrong_key_preserves','unsafe_config',
+        if scenario in ('existing_custom_source','existing_saved_site','interactive_existing_site','wrong_key_preserves','unsafe_config',
                         'symlink_config','failed_save_preserves_pair', 'reuse_pinned_key', 'unsafe_pinned_key', 'corrupt_pinned_key'):
             keydir.mkdir(mode=0o700, exist_ok=True)
             oldkey.write_bytes(b'previous custom trusted key bytes')
             oldkey.chmod(0o600)
             original = f'SOURCE=https://old.example/release\nKEYRING={oldkey}\nHEALTH_URL=https://site.example/health.php\n'
+            if scenario in ('existing_saved_site','interactive_existing_site'):
+                original = f'SOURCE=https://old.example/release\nKEYRING={oldkey}\nHEALTH_URL=auto\nSITE={other_record}\n'
             config.write_text(original)
             config.chmod(0o600)
         if scenario in ('reuse_pinned_key', 'unsafe_pinned_key', 'corrupt_pinned_key'):
@@ -70,7 +74,26 @@ for scenario in ('fresh', 'existing_custom_source', 'wrong_key_preserves', 'fail
 profile_check() { return 0; }
 need() { return 0; }
 php() { printf '8.2.20'; }
-http_check() { [ "$SCENARIO" != failed_health ]; }
+validate_managed_site() {
+    [[ "$1" = 'http|site.example|80|/var/www/site' || "$1" = 'http|other.example|80|/var/www/other' ]]
+}
+select_managed_site() {
+    printf '%s\n%s\n' "$1" "$2" > "$SELECTION"
+    case "$SCENARIO" in
+        ambiguous_sites) echo fixture-ambiguous-use-site >&2; return 65 ;;
+        selection_cancelled) echo fixture-site-selection-cancelled >&2; return 130 ;;
+    esac
+    case "$1" in
+        ''|'http|site.example|80|/var/www/site') MANAGED_SITE='http|site.example|80|/var/www/site' ;;
+        other.example|'http|other.example|80|/var/www/other') MANAGED_SITE='http|other.example|80|/var/www/other' ;;
+        *) echo unexpected-site-selector >&2; return 65 ;;
+    esac
+}
+http_check() {
+    [ "$1" = auto ] && [ "$2" = 8.2.20 ] && validate_managed_site "$MANAGED_SITE" || return 1
+    printf '%s\n' "$MANAGED_SITE" > "$PROBE"
+    [ "$SCENARIO" != failed_health ]
+}
 safe_download() {
     if [ "$SCENARIO" = wrong_key_preserves ]; then printf 'wrong key' > "$2"; else cp "$FIXTURE_KEY" "$2"; fi
 }
@@ -80,39 +103,41 @@ mv() {
     if [ "$SCENARIO" = failed_save_preserves_pair ] && [ "$destination" = "$CONFIG" ]; then echo fixture-save-failure >&2; return 1; fi
     command mv "$@"
 }
-setup_auto_update
+setup_args=()
+[ "$SCENARIO" != explicit_site ] || setup_args=(--site other.example)
+setup_auto_update "${setup_args[@]}"
 exit $?
 '''
         command=home/'run.sh'
         fixture_file = home/'fixture-key.gpg'
         fixture_file.write_bytes(fixture_key)
         command.write_text(copied+'\n'+stubs,encoding='utf-8')
-        inputs='https://site.example/health.php\n'+('CANCEL\n' if scenario=='cancel' else 'СОХРАНИТЬ НАСТРОЙКИ\n')
-        if scenario=='existing_custom_source':
-            inputs='\nСОХРАНИТЬ НАСТРОЙКИ\n'
-        master,slave=pty.openpty()
-        child=subprocess.Popen(['/bin/bash',str(command)],stdin=slave,stdout=slave,stderr=slave,
-                               env=dict(os.environ,SCENARIO=scenario,CONFIG=str(config),FIXTURE_KEY=str(fixture_file)))
-        os.close(slave)
-        os.write(master,inputs.encode())
-        output=bytearray()
-        until=time.monotonic()+5
-        while time.monotonic()<until:
-            if select.select([master],[],[],.05)[0]:
-                try: chunk=os.read(master,65536)
-                except OSError: break
-                if not chunk: break
-                output.extend(chunk)
-            elif child.poll() is not None: break
-        if child.poll() is None: child.kill()
-        code=child.wait()
-        os.close(master)
+        selection = home/'selection'
+        probe = home/'probe'
+        master = slave = None
+        if scenario == 'interactive_existing_site': master, slave = pty.openpty()
+        child=subprocess.run(['/bin/bash',str(command)],stdin=slave if slave is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                             timeout=5, env=dict(os.environ,SCENARIO=scenario,CONFIG=str(config),FIXTURE_KEY=str(fixture_file),
+                                                 SELECTION=str(selection),PROBE=str(probe)))
+        if master is not None:
+            os.close(slave)
+            os.close(master)
+        output=child.stdout
+        code=child.returncode
         try:
-            if scenario in ('fresh','existing_custom_source','reuse_pinned_key'):
+            if scenario in ('fresh','explicit_site','existing_saved_site','interactive_existing_site','existing_custom_source','reuse_pinned_key'):
                 assert code==0, f'exit {code}'
                 data=dict(line.split('=',1) for line in config.read_text().splitlines())
                 assert data['SOURCE']==project_source, 'custom source paired with project key'
-                assert data['HEALTH_URL']=='https://site.example/health.php'
+                assert data['HEALTH_URL']=='auto'
+                expected_site = other_record if scenario in ('explicit_site','existing_saved_site') else site_record
+                assert data['SITE']==expected_site
+                assert probe.read_text().strip()==expected_site, 'saved site differs from checked site'
+                selection_lines=selection.read_text().splitlines()
+                assert selection_lines[1]==('0' if scenario=='interactive_existing_site' else '1'), 'wrong selection mode'
+                if scenario=='interactive_existing_site': assert selection_lines[0]=='', 'interactive setup reused previous site'
+                if scenario=='explicit_site': assert selection_lines[0]=='other.example'
+                if scenario=='existing_saved_site': assert selection_lines[0]==other_record
                 savedkey=Path(data['KEYRING'])
                 assert hashlib.sha256(savedkey.read_bytes()).hexdigest()==key_hash
                 assert stat.S_IMODE(config.stat().st_mode)==0o600
@@ -122,8 +147,9 @@ exit $?
                 assert code!=0, 'expected refusal'
                 expected = {
                     'wrong_key_preserves': 'Публичный ключ не совпадает',
-                    'failed_health': 'Сначала настройте закрытый веб-тест',
-                    'cancel': 'Операция отменена',
+                    'failed_health': 'Автоматическая проверка сайта не пройдена',
+                    'ambiguous_sites': 'fixture-ambiguous-use-site',
+                    'selection_cancelled': 'fixture-site-selection-cancelled',
                     'unsafe_config': 'Нужна конфигурация автоматического обновления в защищённом файле root',
                     'unsafe_keydir': 'Каталог /etc/bitrix-php-update должен принадлежать root',
                     'symlink_config': 'Нужна конфигурация автоматического обновления в защищённом файле root',
