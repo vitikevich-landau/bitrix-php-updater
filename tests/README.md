@@ -16,6 +16,7 @@ docker run --rm --network none --read-only \
     bash /repo/tests/test-publisher-client.sh /repo/install.sh
     bash /repo/tests/test-publisher-client.sh /repo/install.sh 8.3
     bash /repo/tests/test-environment.sh /repo/install.sh
+    python -B /repo/tests/test-confirmations.py /repo/install.sh
   '
 ```
 
@@ -31,6 +32,7 @@ docker run --rm --network none --read-only \
   python:3.11-slim bash -c '
     set -e
     python -B /repo/tests/test-menu.py /repo/install.sh
+    python -B /repo/tests/test-confirmations.py /repo/install.sh
     python -B /repo/tests/test-setup.py /repo/install.sh
     python -B /repo/tests/test-managed-integration.py /repo/install.sh
   '
@@ -43,6 +45,7 @@ docker run --rm --network none --read-only \
 | `test-publisher.sh` | Реальные RSA-подписи манифестов, экспорт только публичного ключа, точные имена старых RPM, отказ при повреждённых входах и отсутствие частично опубликованного каталога. |
 | `test-publisher-client.sh` | Передачу реально подписанного выпуска клиенту, выбор точных старых пакетов, необходимые новые модули, повторное использование подписанного подмножества, ошибки подписи/хеша/загрузки, защищённую конфигурацию и отказ до установки. |
 | `test-menu.py` | Навигацию, значения по умолчанию, отмену, EOF, запуск `--check-site` без вопроса об URL и автоматическую проверку при пустом URL ручной установки. |
+| `test-confirmations.py` | Подтверждения через настоящий терминал при `LC_ALL=C`: ответы да/нет и y/n/yes/no, регистр, пробелы, прежние полные фразы, повтор вопроса при опечатке, отказ по Enter/EOF и отдельный ответ на каждый вопрос. Проверяет обычный вход `--bootstrap-python`, останавливая его перед первой записью после согласия. |
 | `test-setup.py` | Настройку без терминала и ручного URL, явный/сохранённый выбор сайта, повторный выбор в терминале, закрепление хеша ключа, права и символьные ссылки, отказы выбора/проверки, сохранность прежней конфигурации при ошибке. |
 | `test-managed-integration.py` | Конфигурации auto и прежние URL, передачу точного выбора без повторного запроса, `--site`, отсутствие временного теста в read-only `--check`, запись описания сайта и откат без PHP/discovery до восстановления. |
 

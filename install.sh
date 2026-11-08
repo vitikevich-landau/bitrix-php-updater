@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Bitrix Server Master 1.0.0-rc10 — диагностика и обновление PHP 8.2.35 / 8.3.36.
+# Bitrix Server Master 1.0.0-rc11 — диагностика и обновление PHP 8.2.35 / 8.3.36.
 set -o pipefail
 umask 077
 export LC_ALL=C
-MASTER_VERSION='1.0.0-rc10'
+MASTER_VERSION='1.0.0-rc11'
 MANAGED_SITE=''
 PY_RELEASE='3.11.18'
 PY_BUILD='20261026'
@@ -13,6 +13,44 @@ PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 help_ru() { update_help; }
+
+normalize_confirmation() {
+    local answer="$1" letters
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    answer="${answer,,}"
+    # При LC_ALL=C Bash меняет регистр только ASCII. Русские буквы заменяем явно.
+    for letters in А:а Б:б В:в Г:г Д:д Е:е Ё:ё Ж:ж З:з И:и Й:й К:к Л:л М:м \
+                   Н:н О:о П:п Р:р С:с Т:т У:у Ф:ф Х:х Ц:ц Ч:ч Ш:ш Щ:щ \
+                   Ъ:ъ Ы:ы Ь:ь Э:э Ю:ю Я:я; do
+        answer="${answer//${letters%:*}/${letters#*:}}"
+    done
+    printf '%s' "$answer"
+}
+
+confirm_action() {
+    local label="$1" phrase="${2:-}" input normalized expected=''
+    if [ -n "$phrase" ]; then
+        expected="$(normalize_confirmation "$phrase")"
+        printf 'Можно также ввести «%s» без учёта регистра.\n' "$phrase"
+    fi
+    while :; do
+        printf '%s [y/N, да/нет]\n> ' "$label"
+        if ! IFS= read -r input; then
+            printf '\n'
+            return 1
+        fi
+        normalized="$(normalize_confirmation "$input")"
+        case "$normalized" in
+            y|yes|да) return 0 ;;
+            n|no|нет|'') return 1 ;;
+        esac
+        if [ -n "$expected" ] && [ "$normalized" = "$expected" ]; then
+            return 0
+        fi
+        echo 'Введите y/yes/да для согласия или n/no/нет для отказа. Enter — отказ.'
+    done
+}
 
 python_is_ok() {
     local c="$1"
@@ -40,7 +78,7 @@ python_path() {
 }
 
 bootstrap_python() {
-    local archive="$1" response base parent target tmp url result available_kb
+    local archive="$1" base parent target tmp url result available_kb
     if [ ! -t 0 ]; then
         echo 'ОШИБКА: установка Python требует интерактивного подтверждения в SSH.' >&2
         return 5
@@ -75,9 +113,7 @@ bootstrap_python() {
     echo "Ожидаемый SHA-256: $PY_SHA256"
     echo 'Системный /usr/bin/python, yum, PHP, Apache и конфигурации не изменяются.'
     echo 'Будет создан отдельный каталог и временные файлы для проверки архива.'
-    printf 'Подтвердить установку? Введите ДА (заглавными буквами): '
-    IFS= read -r response
-    if [ "$response" != 'ДА' ]; then
+    if ! confirm_action 'Подтвердить установку?'; then
         echo 'Отменено. Изменений нет.'
         return 4
     fi
@@ -324,13 +360,14 @@ status_line() {
 require_root() { if [ "$(id -u)" -ne 0 ]; then err 'Для этой операции нужны права root.'; return 10; fi; }
 need() { local c; for c in "$@"; do if ! command -v "$c" >/dev/null 2>&1; then err "Не найдена программа: $c"; return 11; fi; done; }
 confirm_phrase() {
-    local label="$1" phrase="$2" input
+    local label="$1" phrase="$2"
     if [ ! -t 0 ]; then err "Для действия «$label» нужен интерактивный терминал."; return 12; fi
     echo
     printf '%s\n' "$label"
-    printf 'Для подтверждения введите точно: %s\n> ' "$phrase"
-    IFS= read -r input || return 12
-    if [ "$input" != "$phrase" ]; then msg 'Операция отменена, подтверждение не получено.'; return 12; fi
+    if ! confirm_action 'Продолжить?' "$phrase"; then
+        msg 'Операция отменена, подтверждение не получено.'
+        return 12
+    fi
 }
 platform_check() {
     local ID='' VERSION_ID=''
@@ -2143,7 +2180,7 @@ show_status() {
 
 update_help() {
     cat <<'EOF'
-BITRIX SERVER MASTER 1.0.0-rc10 — диагностика и обновление PHP 8.2 / 8.3
+BITRIX SERVER MASTER 1.0.0-rc11 — диагностика и обновление PHP 8.2 / 8.3
 
 Проверка и отчёт
   bash install.sh --check
@@ -3381,7 +3418,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = '1.0.0-rc10'
+VERSION = '1.0.0-rc11'
 PHP_EOL = {'5.6': '2018-12-31', '7.0': '2019-01-10', '7.1': '2019-12-01',
            '7.2': '2020-11-30', '7.3': '2021-12-06', '7.4': '2022-11-28',
            '8.0': '2023-11-26', '8.1': '2025-12-31', '8.2': '2026-12-31',
