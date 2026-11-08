@@ -5,6 +5,7 @@ umask 077
 export LC_ALL=C
 MASTER_VERSION='1.0.0-rc11'
 MANAGED_SITE=''
+MENU_RESULT_ENABLED=0
 PY_RELEASE='3.11.18'
 PY_BUILD='20261026'
 PY_ARTIFACT='cpython-3.11.18+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
@@ -13,6 +14,15 @@ PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 help_ru() { update_help; }
+
+# Private, opt-in channel to the interactive parent. Never parse human output or
+# source these records; ordinary CLI invocations cannot enable it via environment.
+menu_record() {
+    [ "$MENU_RESULT_ENABLED" = 1 ] || return 0
+    case "$1" in site|session|state|origin|web) ;; *) return 0 ;; esac
+    case "$2" in *$'\n'*|*$'\r'*|*$'\t'*) return 0 ;; esac
+    { printf '%s\t%s\n' "$1" "$2" >&3; } 2>/dev/null || true
+}
 
 normalize_confirmation() {
     local answer="$1" letters
@@ -492,6 +502,7 @@ session_setup() {
     mkdir -m 0700 -- "$SESSION_DIR" || return
     LOG_FILE="$UPDATER_LOG/$SESSION_NAME.log"
     (set -o noclobber; : > "$LOG_FILE") || return
+    menu_record session "$SESSION_NAME"
     # Журнал не держит блокировку после завершения операции.
     exec > >(tee -a -- "$LOG_FILE" 9>&-) 2>&1
     msg "Сессия $SESSION_NAME. Журнал: $LOG_FILE"
@@ -506,6 +517,7 @@ mark_state() {
         err "Не удалось записать состояние сессии: $1"
         return 22
     fi
+    menu_record state "$1"
 }
 
 show_os_status() {
@@ -1343,8 +1355,10 @@ run_auto_update() (
         err 'Исходный комплект RPM PHP не согласован с версией CLI.'; return 80
     fi
     if ! http_check "$AUTO_HEALTH_URL" "$current"; then
+        menu_record web failed
         err 'Исходный веб-PHP не прошёл проверку. Исправьте маршрут проверки или сайт перед обновлением.'; return 80
     fi
+    menu_record web ok
     cp -P -- "$AUTO_KEYRING" "$work/public.gpg" && chmod 0600 -- "$work/public.gpg" || return 81
     msg 'Проверка подписанных каталогов новых и прежних RPM...'
     prepare_auto_catalog "$AUTO_SOURCE" OLD "$work/old" "$work/public.gpg" &&
@@ -1999,6 +2013,7 @@ run_rollback() {
     local -a rollback_rpms=() rollback_flags=(--oldpackage)
     require_root || return
     [[ "$id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || { err 'Укажите идентификатор сессии обновления через --session.'; return 71; }
+    menu_record origin "$id"
     need rpm httpd systemctl curl tar awk sort grep cmp sync || return
     session_setup || return
     dir="$SESSION_DIR"
@@ -2176,6 +2191,13 @@ show_status() {
         cat -- "$last/rollback-of"
     fi
     echo 'Информация о сессии хранится в каталоге с правами root.'
+    if private_session_dir "$last" && private_session_file "$last/state"; then
+        menu_record session "${last##*/}"
+        menu_record state "$(cat -- "$last/state")"
+        if private_session_file "$last/rollback-of"; then
+            menu_record origin "$(cat -- "$last/rollback-of")"
+        fi
+    fi
 }
 
 update_help() {
@@ -2511,6 +2533,233 @@ updater_dispatch() {
 }
 
 # Подменю используют те же команды и проверки, что и запуск с флагами.
+menu_update_readiness() {
+    local route detail
+    NEXT_STATUS=unknown NEXT_REASON='' NEXT_VERSION='' NEXT_TARGET=''
+    NEXT_VERSION="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || NEXT_VERSION=''
+    if select_php_target_for_version "$NEXT_VERSION"; then NEXT_TARGET="$TARGET_PHP"; fi
+    route="$(php_version_route "$NEXT_VERSION")"
+    case "$route" in
+        older) NEXT_STATUS=legacy; NEXT_REASON='Сначала нужен переход через штатное меню BitrixEnv.'; return ;;
+        unsupported) NEXT_STATUS=unsupported; NEXT_REASON='Эта ветка PHP не поддерживается мастером.'; return ;;
+        newer) NEXT_STATUS=newer; NEXT_REASON='PHP новее цели этого выпуска; понижение не требуется.'; return ;;
+        unknown) NEXT_REASON='Версия PHP не определена. Выполните подробную диагностику.'; return ;;
+    esac
+    if ! detail="$(profile_check 2>&1)"; then
+        NEXT_STATUS=blocked
+        [ "$(id -u)" = 0 ] || NEXT_STATUS=needs_root
+        NEXT_REASON="${detail##*$'\n'}"; NEXT_REASON="${NEXT_REASON#ОШИБКА: }"
+    elif ! detail="$(php_rpm_versions_check "$NEXT_VERSION" 2>&1)"; then
+        NEXT_STATUS=blocked
+        NEXT_REASON="Пакеты PHP не согласованы или не подтверждены: ${detail##*$'\n'}"
+    elif [ "$route" = target ]; then
+        NEXT_STATUS=current; NEXT_REASON='Цель этого выпуска уже установлена.'
+    elif [ "$(id -u)" != 0 ]; then
+        NEXT_STATUS=needs_root; NEXT_REASON='Для подготовки обновления нужны права root.'
+    else
+        NEXT_STATUS=ready; NEXT_REASON='Профиль подходит. Можно начать подготовку обновления.'
+    fi
+}
+
+menu_invoke() {
+    local scratch="${MENU_RESULT_DIR:-}" own=0 rc=0 key value
+    MENU_SESSION='' MENU_STATE='' MENU_ORIGIN='' MENU_SITE='' MENU_WEB=''
+    if [ -z "$scratch" ]; then
+        scratch="$(mktemp -d "${TMPDIR:-/tmp}/bitrix-menu.XXXXXXXX")" || return 1
+        own=1
+    fi
+    bash "$SELF" --menu-action "$@" 3>"$scratch/result" || rc=$?
+    while IFS=$'\t' read -r key value; do
+        case "$value" in *$'\t'*|*$'\r'*) continue ;; esac
+        case "$key" in
+            site) MENU_SITE="$value" ;;
+            session) [[ "$value" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] && MENU_SESSION="$value" ;;
+            origin) [[ "$value" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] && MENU_ORIGIN="$value" ;;
+            state) [[ "$value" =~ ^[a-z_]+$ ]] && MENU_STATE="$value" ;;
+            web) case "$value" in ok|failed) MENU_WEB="$value" ;; esac ;;
+        esac
+    done < "$scratch/result"
+    if [ "$own" = 1 ]; then rm -f -- "$scratch/result"; rmdir -- "$scratch"; fi
+    return "$rc"
+}
+
+menu_can_rollback() {
+    local source
+    [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || return 1
+    source="$UPDATER_STATE/sessions/$1"
+    private_session_dir "$source" && private_session_file "$source/state" || return 1
+    case "$(cat -- "$source/state")" in
+        installing|installation_failed|installed|apache_config_failed|restart_failed|verifying|verify_failed|completed) return 0 ;;
+    esac
+    return 1
+}
+
+menu_state_text() {
+    case "$1" in
+        started) echo 'Подготовка операции' ;;
+        precheck_failed|install_test_failed|backup_failed) echo 'Подготовка остановлена до установки PHP' ;;
+        installing|installation_failed) echo 'Установка была начата; требуется проверка состояния пакетов' ;;
+        installed|apache_config_failed|restart_failed|verifying|verify_failed) echo 'Пакеты изменены; проверка результата не завершена успешно' ;;
+        completed) echo 'Обновление завершено, автоматические проверки пройдены' ;;
+        already_current) echo 'Обновление не требуется, установленный PHP проверен' ;;
+        rollback_completed) echo 'Откат завершён, автоматические проверки пройдены' ;;
+        rollback_precheck_failed|rollback_test_failed) echo 'Подготовка отката остановлена' ;;
+        rolling_back|rollback_failed|rollback_verify_failed|rollback_apache_config_failed|rollback_restart_failed) echo 'Восстановление не завершено; проверьте журнал' ;;
+        *) echo 'Состояние не подтверждено; проверьте сведения об операции' ;;
+    esac
+}
+
+menu_session_details() {
+    local id="$1" dir log
+    [[ "$id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || return 1
+    dir="$UPDATER_STATE/sessions/$id"; log="$UPDATER_LOG/$id.log"
+    private_session_dir "$dir" && private_session_file "$dir/state" || {
+        status_line warning 'Сведения об этой операции недоступны. Нужны права root.'; return 1;
+    }
+    printf '\nОперация: %s\nКаталог: %s\n' "$id" "$dir"
+    menu_state_text "$(cat -- "$dir/state")"
+    if private_session_file "$dir/rollback-of"; then
+        printf 'Исходное обновление: '; cat -- "$dir/rollback-of"
+    fi
+    if private_session_file "$log"; then
+        printf '\nПоследние 50 строк журнала %s:\n' "$log"
+        tail -n 50 -- "$log"
+    else
+        printf 'Журнал недоступен: %s\n' "$log"
+    fi
+}
+
+menu_option() { MENU_OPTIONS+=("$1"); MENU_LABELS+=("$2"); }
+
+menu_next_actions() {
+    local action="$1" rc="$2" choice i recovery="${MENU_ORIGIN:-$MENU_SESSION}" operation=0 retry=0
+    MENU_OPTIONS=() MENU_LABELS=() MENU_NEXT=''
+    printf '\n'
+    status_line info 'Что дальше'
+    case "$action:$rc" in
+        --check-site:12) echo 'Проверка сайта отменена; веб-PHP этой проверкой не подтверждён.' ;;
+        --setup-update:12) echo 'Настройка отменена; новые настройки не сохранены.' ;;
+        --check-site:0|--setup-update:0) ;;
+        --check-site:*) echo 'Проверка сайта не завершена. Причина указана выше.' ;;
+        --setup-update:*) echo 'Настройка не завершена. Устраните указанную выше причину и повторите её.' ;;
+    esac
+    case "$action" in
+        --auto-update|--update|--rollback|--status)
+            operation=1
+            if [ "$rc" = 12 ]; then
+                echo 'Операция отменена. Для запуска потребуется новый явный выбор.'
+            elif [ -n "$MENU_STATE" ]; then
+                menu_state_text "$MENU_STATE"
+            elif [ "$rc" != 0 ]; then
+                echo 'Операция остановлена. Причина указана выше; сначала устраните её.'
+            else
+                echo 'Сведения об операции показаны выше.'
+            fi
+            [ -z "$MENU_SESSION" ] || printf 'Сессия: %s\n' "$MENU_SESSION"
+            [ -z "$MENU_ORIGIN" ] || printf 'Исходное обновление: %s\n' "$MENU_ORIGIN"
+            case "$MENU_STATE" in
+                completed|already_current|rollback_completed)
+                    echo 'Проверьте вручную сайт, админку Битрикса, формы и основные функции.' ;;
+            esac
+            if [ -n "$MENU_SESSION" ]; then menu_option details 'Показать сведения и журнал этой операции'; fi
+            if [ "$MENU_STATE" != rollback_completed ] && menu_can_rollback "$recovery"; then
+                MENU_RECOVERY_ID="$recovery"
+                if [ -n "$MENU_ORIGIN" ]; then
+                    menu_option rollback 'Повторить откат исходного обновления'
+                else
+                    menu_option rollback 'Откатить это обновление'
+                fi
+            fi
+            case "$action:$MENU_STATE" in
+                --auto-update:|--auto-update:started|--auto-update:precheck_failed|--auto-update:install_test_failed|--auto-update:backup_failed)
+                    [ "$rc" = 0 ] || retry=1 ;;
+            esac
+            ;;
+    esac
+    if [ "$operation" = 0 ] || [ "$retry" = 1 ]; then
+        menu_update_readiness
+        [ -z "$NEXT_VERSION" ] || printf 'Текущий PHP: %s\n' "$NEXT_VERSION"
+        [ -z "$NEXT_TARGET" ] || printf 'Цель этого выпуска: %s\n' "$NEXT_TARGET"
+        printf '%s\n' "$NEXT_REASON"
+        if [ "$NEXT_STATUS" = ready ] && [ "${MENU_WEB_BLOCKED:-0}" != 1 ]; then
+            echo 'Проверки сайта, пакетов и возможности отката выполняются при подготовке.'
+            echo 'Заранее подготовьте проверенную резервную копию или снимок ВМ.'
+            echo 'Отдельно подтвердите резервную копию, затем — обновление с перезапуском Apache.'
+            if [ "$retry" = 1 ]; then
+                menu_option auto 'Повторить подготовку автоматического обновления после исправления причины'
+            else
+                menu_option auto 'Подготовить автоматическое обновление PHP'
+            fi
+        elif [ "$NEXT_STATUS" = needs_root ]; then
+            echo 'Запустите мастер от root и повторите проверку; дополнительные права из меню не выдаются.'
+        fi
+        if [ "${MENU_WEB_BLOCKED:-0}" = 1 ]; then
+            echo 'PHP сайта ещё не подтверждён. Сначала устраните причину и повторите проверку сайта.'
+        fi
+        if [ "$NEXT_STATUS" = legacy ]; then
+            menu_option plan 'Посмотреть план перехода через BitrixEnv'
+        elif [ "$NEXT_STATUS" != unknown ] && [ "$NEXT_STATUS" != unsupported ]; then
+            menu_option site 'Проверить PHP сайта'
+            if [ -n "${MENU_CONTEXT_SITE:-}" ] || [ "${MENU_WEB_BLOCKED:-0}" = 1 ]; then
+                menu_option choose_site 'Выбрать другой сайт и проверить PHP'
+            fi
+            menu_option plan 'Посмотреть план для этого сервера'
+        fi
+        menu_option check 'Повторить быструю проверку'
+        menu_option audit 'Подробная диагностика с отчётом без сети'
+        if [ "$action" = --setup-update ] || [ "$retry" = 1 ]; then
+            menu_option setup 'Повторить настройку источника и сайта'
+        fi
+    else
+        menu_option check 'Выполнить быструю проверку'
+        menu_option site 'Проверить PHP сайта'
+    fi
+    while :; do
+        echo
+        for i in "${!MENU_OPTIONS[@]}"; do printf ' %s. %s\n' "$((i+1))" "${MENU_LABELS[$i]}"; done
+        echo ' 0. Назад в ручное меню (Enter)'
+        printf '\n Выберите действие [0]: '
+        IFS= read -r choice || return 1
+        case "$choice" in ''|0) return 0 ;; esac
+        if ! [[ "$choice" =~ ^[1-9][0-9]?$ ]] || [ "$choice" -gt "${#MENU_OPTIONS[@]}" ]; then
+            echo 'Неизвестный пункт. Выберите номер из списка.'; continue
+        fi
+        MENU_NEXT="${MENU_OPTIONS[$((10#$choice-1))]}"
+        if [ "$MENU_NEXT" = details ]; then menu_session_details "$MENU_SESSION"; MENU_NEXT=''; continue; fi
+        return 0
+    done
+}
+
+menu_action() (
+    local action rc
+    local -a args=("$@")
+    local MENU_CONTEXT_SITE='' MENU_WEB_BLOCKED=0 MENU_RESULT_DIR
+    [ -t 0 ] || { bash "$SELF" "$@"; return $?; }
+    MENU_RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bitrix-menu.XXXXXXXX")" || return 1
+    trap 'rm -f -- "$MENU_RESULT_DIR/result"; rmdir -- "$MENU_RESULT_DIR"' EXIT
+    while :; do
+        action="${args[0]}"; rc=0
+        menu_invoke "${args[@]}" || rc=$?
+        [ -z "$MENU_SITE" ] || MENU_CONTEXT_SITE="$MENU_SITE"
+        case "$MENU_WEB" in ok) MENU_WEB_BLOCKED=0 ;; failed) MENU_WEB_BLOCKED=1 ;; esac
+        menu_next_actions "$action" "$rc" || return 1
+        case "$MENU_NEXT" in
+            '') return 0 ;;
+            auto) args=(--auto-update) ;;
+            check) args=(--check) ;;
+            plan) args=(--plan) ;;
+            audit) args=(--audit --offline) ;;
+            site) args=(--check-site) ;;
+            choose_site) MENU_CONTEXT_SITE=''; args=(--check-site) ;;
+            setup) MENU_CONTEXT_SITE=''; args=(--setup-update) ;;
+            rollback) args=(--rollback --session "$MENU_RECOVERY_ID") ;;
+        esac
+        case "$MENU_NEXT" in
+            auto|site) [ -z "$MENU_CONTEXT_SITE" ] || args+=(--site "$MENU_CONTEXT_SITE") ;;
+        esac
+    done
+)
+
 menu_checks() {
     local choice
     while :; do
@@ -2527,12 +2776,12 @@ menu_checks() {
         printf '\n Выберите действие [1]: '
         IFS= read -r choice || return 1
         case "$choice" in
-          1|'') bash "$SELF" --check ;;
-          2) bash "$SELF" --plan ;;
-          3) bash "$SELF" --audit --offline ;;
-          4) bash "$SELF" --audit ;;
-          5) bash "$SELF" --check-site ;;
-          6) bash "$SELF" --diagnose --full --offline ;;
+          1|'') menu_action --check || return 1 ;;
+          2) menu_action --plan || return 1 ;;
+          3) menu_action --audit --offline || return 1 ;;
+          4) menu_action --audit || return 1 ;;
+          5) menu_action --check-site || return 1 ;;
+          6) menu_action --diagnose --full --offline || return 1 ;;
           7) bash "$SELF" --bootstrap-python ;;
           0) return 0 ;;
           *) echo 'Неизвестный пункт меню.' ;;
@@ -2556,9 +2805,9 @@ menu_install_rpms() {
     printf 'Закрытый URL проверки (Enter — автоматический временный тест): '
     IFS= read -r site || return 1
     if [ -n "$site" ]; then
-        bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" --url "$site"
+        menu_action --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" --url "$site" || return 1
     else
-        bash "$SELF" --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring"
+        menu_action --update --rpm-dir "$rpm_path" --rollback-dir "$old_path" --rpm-keyring "$keyring" || return 1
     fi
     return 0
 }
@@ -2591,8 +2840,8 @@ menu_update() {
         echo
         status_line info 'Подготовка и обновление PHP'
         echo ' 1. Посмотреть план для этого сервера (по умолчанию)'
-        echo ' 2. Подготовить и обновить из настроенного доверенного выпуска'
-        echo ' 3. Настроить автоматическое обновление — один раз на клиенте'
+        echo ' 2. Автоматическое обновление PHP — настройка и проверки включены'
+        echo ' 3. Настройки источника и сайта — повторить настройку'
         echo ' 4. Собрать RPM PHP 8.2 на отдельной сборочной ВМ'
         echo ' 5. Установить подписанные RPM вручную — расширенный режим'
         echo ' 6. Подписать выпуск PHP 8.2 на доверенной сборочной машине'
@@ -2602,9 +2851,9 @@ menu_update() {
         printf '\n Выберите действие [1]: '
         IFS= read -r choice || return 1
         case "$choice" in
-          1|'') bash "$SELF" --plan ;;
-          2) bash "$SELF" --auto-update ;;
-          3) bash "$SELF" --setup-update ;;
+          1|'') menu_action --plan || return 1 ;;
+          2) menu_action --auto-update || return 1 ;;
+          3) menu_action --setup-update || return 1 ;;
           4) bash "$SELF" --build --builder ;;
           5) menu_install_rpms || return 1 ;;
           6) menu_prepare_release || return 1 ;;
@@ -2627,14 +2876,14 @@ menu_recovery() {
         printf '\n Выберите действие [1]: '
         IFS= read -r choice || return 1
         case "$choice" in
-          1|'') bash "$SELF" --status ;;
+          1|'') menu_action --status || return 1 ;;
           2)
              printf 'ID исходной сессии обновления (Enter — отмена): '
              IFS= read -r session || return 1
              if [ -z "$session" ]; then
                  echo 'Откат отменён.'
              else
-                 bash "$SELF" --rollback --session "$session"
+                 menu_action --rollback --session "$session" || return 1
              fi ;;
           0) return 0 ;;
           *) echo 'Неизвестный пункт меню.' ;;
@@ -2669,7 +2918,7 @@ full_menu() {
 }
 
 check_site_dispatch() {
-    local selector='' cli='' unattended=0
+    local selector='' cli='' unattended=0 rc=0
     MANAGED_SITE=''
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2686,7 +2935,9 @@ check_site_dispatch() {
     [ -t 0 ] || unattended=1
     select_managed_site "$selector" "$unattended" || return
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || { err 'Не удалось определить версию PHP CLI.'; return 63; }
-    http_check auto "$cli"
+    http_check auto "$cli" || rc=$?
+    if [ "$rc" = 0 ]; then menu_record web ok; else menu_record web failed; fi
+    return "$rc"
 }
 
 setup_auto_update() (
@@ -2721,7 +2972,8 @@ setup_auto_update() (
     select_managed_site "$selector" "$unattended" || return
     health_target_validate auto || return
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || return 61
-    http_check auto "$cli" || { err 'Автоматическая проверка сайта не пройдена. Настройки не сохранены.'; return 61; }
+    http_check auto "$cli" || { menu_record web failed; err 'Автоматическая проверка сайта не пройдена. Настройки не сохранены.'; return 61; }
+    menu_record web ok
     printf 'Проверка сайта пройдена для PHP %s.\n' "$cli"
     if [ -e "$keydir" ] || [ -L "$keydir" ]; then
         private_session_dir "$keydir" || { err 'Каталог /etc/bitrix-php-update должен принадлежать root с правами 0700.'; return 61; }
@@ -3003,6 +3255,7 @@ select_managed_site() {
     if [ "${#matches[@]}" -eq 0 ]; then err 'Выбранный сайт не найден в активной конфигурации Apache. Повторите выбор сайта.'; return 83; fi
     if [ "${#matches[@]}" -eq 1 ]; then
         MANAGED_SITE="${MANAGED_SITE_CANDIDATES[${matches[0]}]}"
+        menu_record site "$MANAGED_SITE"
         return 0
     fi
     if [ "$unattended" = 1 ] || [ ! -t 0 ]; then
@@ -3017,6 +3270,7 @@ select_managed_site() {
     if ! [[ "$choice" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$choice" -gt "${#matches[@]}" ]; then err 'Неверный номер сайта. Повторите команду и выберите пункт из списка.'; return 83; fi
     pick="${matches[$((10#$choice-1))]}"
     MANAGED_SITE="${MANAGED_SITE_CANDIDATES[$pick]}"
+    menu_record site "$MANAGED_SITE"
 }
 
 # Managed probes are scoped to one HTTP check. Never import state from the environment.
@@ -3313,6 +3567,13 @@ PHP
 )
 
 # Мутирующие операции: отдельный обработчик Bash, без зависимости от Python.
+if [ "${1:-}" = --menu-action ]; then
+    if [ "$#" -lt 2 ] || [ ! -t 0 ] || ! { true >&3; } 2>/dev/null; then
+        err 'Внутренний режим меню требует терминал и канал результата.'; exit 2
+    fi
+    MENU_RESULT_ENABLED=1
+    shift
+fi
 if [ "$#" -eq 0 ] && [ -t 0 ]; then full_menu; exit $?; fi
 case "${1:-}" in
   --setup-update)

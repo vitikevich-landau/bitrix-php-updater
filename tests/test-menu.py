@@ -49,6 +49,7 @@ with tempfile.TemporaryDirectory() as directory:
     env_file = pathlib.Path(directory) / 'env.sh'
     env_file.write_text("""bash() {
     shift
+    if [ "${1:-}" = --menu-action ]; then shift; fi
     printf 'CALL'
     printf '|%s' "$@"
     printf '\\n'
@@ -57,6 +58,10 @@ with tempfile.TemporaryDirectory() as directory:
     env = dict(os.environ, BASH_ENV=str(env_file), TERM='xterm')
     failed = 0
     for name, inputs, expected, forbidden in cases:
+        # Wrapped child actions now have a safe [0] follow-up before the same
+        # numbered manual submenu. Extra input is harmless for unwrapped tools.
+        if inputs.endswith('0\n0\n'):
+            inputs += '0\n'
         master, slave = pty.openpty()
         child = subprocess.Popen(['/bin/bash', str(installer)], stdin=slave, stdout=slave, stderr=slave, env=env)
         os.close(slave)
