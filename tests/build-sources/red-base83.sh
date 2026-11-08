@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Historical red test against rc9: full definitions plus literal approved 8.3 profile.
+# Исторический тест, выявляющий ошибку в rc9: полные определения и явно заданный утверждённый профиль 8.3.
 set -o pipefail
 [[ ${BITRIX_TEST_DISPOSABLE:-} == 1 && -f /.dockerenv && $# == 3 ]] || exit 2
 mkdir -p "$3" || exit

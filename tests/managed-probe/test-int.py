@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import print_function
 import glob
 import os
@@ -20,7 +21,7 @@ for unused in range(200):
     time.sleep(.05)
 else:
     os.killpg(pid, signal.SIGKILL)
-    raise AssertionError('probe did not reach transport')
+    raise AssertionError('проба не дошла до транспортного уровня')
 os.write(fd, b'\x03')
 for unused in range(200):
     finished, status = os.waitpid(pid, os.WNOHANG)
@@ -29,13 +30,13 @@ for unused in range(200):
     time.sleep(.05)
 else:
     os.killpg(pid, signal.SIGKILL)
-    raise AssertionError('Ctrl-C did not terminate probe')
+    raise AssertionError('Ctrl-C не завершил пробу')
 for unused in range(100):
     if not glob.glob('/var/www/rc9-probe-site/bitrix-master-probe-*') and not glob.glob('/root/managed-probe-test/state/probes/*'):
         break
     time.sleep(.05)
-assert not glob.glob('/var/www/rc9-probe-site/bitrix-master-probe-*'), 'Ctrl-C left public probe'
-assert not glob.glob('/root/managed-probe-test/state/probes/*'), 'Ctrl-C left lease'
-assert status != 0, 'Ctrl-C unexpectedly succeeded'
+assert not glob.glob('/var/www/rc9-probe-site/bitrix-master-probe-*'), 'после Ctrl-C осталась публичная проба'
+assert not glob.glob('/root/managed-probe-test/state/probes/*'), 'после Ctrl-C осталась запись о пробе'
+assert status != 0, 'после Ctrl-C неожиданно получен успешный результат'
 os.close(fd)
-print('PASS real terminal Ctrl-C cleanup')
+print('PASS очистка после настоящего Ctrl-C в терминале')

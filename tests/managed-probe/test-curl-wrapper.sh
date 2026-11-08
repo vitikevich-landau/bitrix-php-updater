@@ -1,4 +1,4 @@
-# Test-only transport faults around the real curl/Apache implementation.
+# Только тестовые сбои транспорта вокруг настоящей реализации curl/Apache.
 curl() {
     local config='' next=0 arg url='' count token path code original
     for arg in "$@"; do
@@ -45,7 +45,7 @@ curl() {
         cleanup_failure)
             if [ "$count" -eq 3 ]; then
                 command curl "$@"
-                printf '\n// externally changed\n' >> "$path"
+                printf '\n// изменено извне\n' >> "$path"
                 return 0
             fi
             ;;

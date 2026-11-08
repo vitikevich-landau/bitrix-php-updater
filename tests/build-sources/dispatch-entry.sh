@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixture: preserve every installer function except the costly compiler boundary.
+# Тестовая подмена: сохраняем все функции установщика, кроме ресурсоёмкого вызова компилятора.
 set -o pipefail
 [[ ${BITRIX_TEST_DISPOSABLE:-} == 1 && -f /.dockerenv && $# -ge 3 ]] || exit 2
 library="$1"
@@ -21,8 +21,8 @@ rpmbuild() {
         esac
         top=${spec%/SPECS/*}
         mkdir -p "$top/RPMS/x86_64" || return
-        # This is explicitly a boundary fixture, never an installable RPM.
-        printf 'TEST ONLY: compilation fixture for PHP %s\n' "$version" > "$top/RPMS/x86_64/php-$version-1.el7.1.x86_64.rpm"
+        # Это исключительно тестовая подмена вызова, а не пригодный для установки RPM.
+        printf 'ТОЛЬКО ДЛЯ ТЕСТА: подмена компиляции PHP %s\n' "$version" > "$top/RPMS/x86_64/php-$version-1.el7.1.x86_64.rpm"
     else
         command rpmbuild "$@"
     fi

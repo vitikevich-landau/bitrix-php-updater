@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Public regression: no downloads, installation, or private keys.
-# Usage: BITRIX_TEST_DISPOSABLE=1 bash test-build-sources.sh INSTALLER SRPM82 SRPM83 OUTPUT
-# Requires an isolated CentOS 7 x86_64 container with rpm-build, cpio, GnuPG and xz.
-# Keep OUTPUT writable and the installer/SRPM mounts read-only.
+# Публичная регрессионная проверка: без скачивания, установки и закрытых ключей.
+# Использование: BITRIX_TEST_DISPOSABLE=1 bash test-build-sources.sh INSTALLER SRPM82 SRPM83 OUTPUT
+# Требуется изолированный контейнер CentOS 7 x86_64 с rpm-build, cpio, GnuPG и xz.
+# OUTPUT должен быть доступен для записи, а установщик и SRPM — смонтированы только для чтения.
 set -o pipefail
 umask 077
 export LC_ALL=C
 if [[ ${BITRIX_TEST_DISPOSABLE:-} != 1 || ! -f /.dockerenv ]]; then
-    echo 'Refusing: run in a disposable Docker container with BITRIX_TEST_DISPOSABLE=1.' >&2
+    echo 'Отказ: запускайте в одноразовом контейнере Docker с BITRIX_TEST_DISPOSABLE=1.' >&2
     exit 2
 fi
-[[ $# == 4 ]] || { echo 'Usage: test-build-sources.sh INSTALLER SRPM82 SRPM83 OUTPUT' >&2; exit 2; }
+[[ $# == 4 ]] || { echo 'Использование: test-build-sources.sh INSTALLER SRPM82 SRPM83 OUTPUT' >&2; exit 2; }
 installer=$(readlink -f -- "$1") || exit
 srpm82=$(readlink -f -- "$2") || exit
 srpm83=$(readlink -f -- "$3") || exit
 mkdir -p -- "$4" || exit
 output=$(readlink -f -- "$4") || exit
 [[ -f $installer && -f $srpm82 && -f $srpm83 ]] || exit 2
-# Load every definition from the complete installer, stopping before its CLI.
+# Загружаем все определения полного установщика, останавливаясь перед его CLI.
 awk '/^# Мутирующие операции:/ {exit} {print}' "$installer" > "$output/library.sh" || exit
 source "$output/library.sh"
 platform_check || exit
@@ -25,32 +25,32 @@ WORK_ROOT="$output/work"
 mkdir -p -- "$WORK_ROOT" || exit
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
-declare -F set_php_target >/dev/null || fail 'installer has no branch selection'
+declare -F set_php_target >/dev/null || fail 'в установщике отсутствует выбор ветки'
 
-# Break caught: hard-coded php82.spec, patch filename, source hash or GPG signer.
+# Выявляемый сбой: жёстко заданные php82.spec, имя патча, хеш исходников или ключ подписи GPG.
 for branch in 8.2 8.3; do
     if [[ $branch == 8.2 ]]; then version=8.2.35; spec=php82.spec; srpm="$srpm82"; else version=8.3.36; spec=php83.spec; srpm="$srpm83"; fi
-    set_php_target "$branch" || fail "select $branch"
+    set_php_target "$branch" || fail "не удалось выбрать ветку $branch"
     target="$output/source-$branch"
-    source_prepare "$target" "$srpm" > "$output/source-$branch.log" 2>&1 || fail "real source_prepare $branch (see source-$branch.log)"
-    [[ -f "$target/topdir" ]] || fail "$branch did not finish %prep"
-    [[ $(cat "$target/topdir") == "$target/rpmbuild" ]] || fail "$branch wrong topdir"
-    [[ -s "$target/rpmbuild/SOURCES/php-$version-openssl102-asn1.patch" ]] || fail "$branch patch artifact"
-    grep -q 'OpenSSL 1.0.2 compatibility (EL7)' "$target/rpmbuild/BUILD/php-$version/ext/openssl/xp_ssl.c" || fail "$branch patch not applied by real %prep"
-    [[ $(rpm -q --qf '%{VERSION}|%{RELEASE}' --specfile "$target/rpmbuild/SPECS/$spec" | head -c 16) == "$version|1.el7.1"* ]] || fail "$branch unexpected spec version/release"
-    rpm -q --requires --specfile "$target/rpmbuild/SPECS/$spec" > "$target/runtime-requires.txt" || fail "$branch spec query"
+    source_prepare "$target" "$srpm" > "$output/source-$branch.log" 2>&1 || fail "ошибка настоящего source_prepare для ветки $branch (см. source-$branch.log)"
+    [[ -f "$target/topdir" ]] || fail "ветка $branch: этап %prep не завершён"
+    [[ $(cat "$target/topdir") == "$target/rpmbuild" ]] || fail "ветка $branch: неверный каталог topdir"
+    [[ -s "$target/rpmbuild/SOURCES/php-$version-openssl102-asn1.patch" ]] || fail "ветка $branch: отсутствует файл патча"
+    grep -q 'Совместимость с OpenSSL 1.0.2 (EL7)' "$target/rpmbuild/BUILD/php-$version/ext/openssl/xp_ssl.c" || fail "ветка $branch: настоящий этап %prep не применил патч"
+    [[ $(rpm -q --qf '%{VERSION}|%{RELEASE}' --specfile "$target/rpmbuild/SPECS/$spec" | head -c 16) == "$version|1.el7.1"* ]] || fail "ветка $branch: неожиданные версия или номер выпуска в спецификации"
+    rpm -q --requires --specfile "$target/rpmbuild/SPECS/$spec" > "$target/runtime-requires.txt" || fail "ветка $branch: ошибка запроса к спецификации"
     if [[ $branch == 8.3 ]]; then
-        rpmspec -q --buildrequires "$target/rpmbuild/SPECS/$spec" > "$target/build-requires.txt" || fail "$branch build requires"
-        grep -Fx 'unixODBC-devel' "$target/build-requires.txt" >/dev/null || fail '8.3 EL7 unixODBC requirement absent'
-        ! grep -Fx 'pkgconfig(odbc)' "$target/build-requires.txt" >/dev/null || fail '8.3 retains unavailable EL7 odbc.pc'
-        bash "$(dirname "$0")/check-ffi-el7.sh" "$target/rpmbuild/BUILD/php-$version/ext/ffi/ffi.c" "$target/ffi-compile-proof" > "$target/ffi-compile-proof.log" 2>&1 || fail '8.3 FFI directive comparisons do not compile with EL7 glibc'
+        rpmspec -q --buildrequires "$target/rpmbuild/SPECS/$spec" > "$target/build-requires.txt" || fail "ветка $branch: ошибка запроса зависимостей сборки"
+        grep -Fx 'unixODBC-devel' "$target/build-requires.txt" >/dev/null || fail 'ветка 8.3: отсутствует зависимость unixODBC для EL7'
+        ! grep -Fx 'pkgconfig(odbc)' "$target/build-requires.txt" >/dev/null || fail 'ветка 8.3: сохранена зависимость odbc.pc, недоступная в EL7'
+        bash "$(dirname "$0")/check-ffi-el7.sh" "$target/rpmbuild/BUILD/php-$version/ext/ffi/ffi.c" "$target/ffi-compile-proof" > "$target/ffi-compile-proof.log" 2>&1 || fail 'ветка 8.3: сравнения директив FFI не компилируются с glibc из EL7'
     fi
-    pass "$branch real SRPM extraction, SHA-256, GPG, compatibility patch and %prep"
+    pass "ветка $branch: настоящее извлечение SRPM, SHA-256, GPG, патч совместимости и %prep"
 done
 
-# Break caught: trusting any successful signature, or checking only an 8.3 subkey
-# without its pinned primary key. The boundary runs real GPG before substituting
-# an unapproved signer field; no private key or forged cryptography is involved.
+# Выявляемый сбой: доверие любой успешной подписи или проверка только подключа 8.3
+# без закреплённого основного ключа. Подмена сначала запускает настоящий GPG, затем заменяет
+# поле подписанта на неразрешённое; закрытый ключ и подделка криптографии не используются.
 gpg() {
     if [[ " $* " == *' --verify '* ]]; then
         local verified
@@ -69,28 +69,28 @@ for test_case in 8.2:signer 8.3:signer 8.3:primary; do
     set_php_target "$branch" || exit
     if [[ $branch == 8.2 ]]; then srpm="$srpm82"; else srpm="$srpm83"; fi
     target="$output/gpg-$branch-$invalid_gpg_field"
-    if source_prepare "$target" "$srpm" > "$target.log" 2>&1; then fail "$test_case unapproved GPG field accepted"; fi
-    [[ ! -f "$target/topdir" && ! -f "$target/prep.log" ]] || fail "$test_case reached %prep"
-    grep -q 'Неожиданный ключ подписи PHP' "$target.log" || fail "$test_case failed for unrelated reason"
-    pass "$test_case rejects unapproved GPG identity before %prep"
+    if source_prepare "$target" "$srpm" > "$target.log" 2>&1; then fail "$test_case: принято недопустимое поле GPG"; fi
+    [[ ! -f "$target/topdir" && ! -f "$target/prep.log" ]] || fail "$test_case: выполнение дошло до этапа %prep"
+    grep -q 'Неожиданный ключ подписи PHP' "$target.log" || fail "$test_case: отказ произошёл по посторонней причине"
+    pass "$test_case: недопустимый ключ GPG отклонён до этапа %prep"
 done
 unset -f gpg
 
-# Break caught: extraction before the full SRPM trust check.
+# Выявляемый сбой: распаковка до полной проверки доверия SRPM.
 cp -- "$srpm83" "$output/corrupt.src.rpm" || exit
 printf 'corruption' >> "$output/corrupt.src.rpm"
 set_php_target 8.3 || exit
-if source_prepare "$output/corrupt" "$output/corrupt.src.rpm" > "$output/corrupt.log" 2>&1; then fail 'corrupt SRPM accepted'; fi
-[[ ! -e "$output/corrupt/source-entries.txt" ]] || fail 'corrupt SRPM payload was inspected'
-[[ -z $(find "$output/corrupt/rpmbuild/SOURCES" -mindepth 1 -print -quit) ]] || fail 'corrupt SRPM extracted'
-pass 'corrupt SRPM refused before payload inspection or extraction'
+if source_prepare "$output/corrupt" "$output/corrupt.src.rpm" > "$output/corrupt.log" 2>&1; then fail 'повреждённый SRPM принят'; fi
+[[ ! -e "$output/corrupt/source-entries.txt" ]] || fail 'содержимое повреждённого SRPM было просмотрено'
+[[ -z $(find "$output/corrupt/rpmbuild/SOURCES" -mindepth 1 -print -quit) ]] || fail 'повреждённый SRPM распакован'
+pass 'повреждённый SRPM отклонён до просмотра содержимого или распаковки'
 
-# Break caught: selected branch accidentally accepting another branch SRPM.
+# Выявляемый сбой: выбранная ветка ошибочно принимает SRPM другой ветки.
 for branch in 8.2 8.3; do
     set_php_target "$branch" || exit
     if [[ $branch == 8.2 ]]; then srpm="$srpm83"; else srpm="$srpm82"; fi
-    if source_prepare "$output/wrong-$branch" "$srpm" > "$output/wrong-$branch.log" 2>&1; then fail "wrong SRPM branch accepted for $branch"; fi
-    [[ ! -e "$output/wrong-$branch/source-entries.txt" ]] || fail "wrong branch payload inspected for $branch"
-    pass "$branch refuses other branch SRPM before extraction"
+    if source_prepare "$output/wrong-$branch" "$srpm" > "$output/wrong-$branch.log" 2>&1; then fail "для ветки $branch принят SRPM другой ветки"; fi
+    [[ ! -e "$output/wrong-$branch/source-entries.txt" ]] || fail "для ветки $branch просмотрено содержимое SRPM другой ветки"
+    pass "ветка $branch: SRPM другой ветки отклонён до распаковки"
 done
-printf 'Source regressions complete. Evidence: %s\n' "$output"
+printf 'Регрессионные проверки исходников завершены. Результаты: %s\n' "$output"

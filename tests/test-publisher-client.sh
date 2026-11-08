@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -eo pipefail
-# Run only inside the disposable container described in README.md.
-# RPM metadata, website and the final install transaction are mocked.
-# Publisher signatures, catalog verification and package selection are real.
-installer="$(readlink -f -- "${1:?Usage: test-publisher-client.sh INSTALLER}")"
+# Запускать только внутри одноразового контейнера, описанного в README.md.
+# Метаданные RPM, сайт и конечная транзакция установки подменены.
+# Подписи издателя, проверка каталогов и выбор пакетов настоящие.
+installer="$(readlink -f -- "${1:?Использование: test-publisher-client.sh INSTALLER}")"
 test -f "$installer"
 grep -q '^# Мутирующие операции:' "$installer"
 source <(sed '/^# Мутирующие операции:/,$d' "$installer")
@@ -29,7 +29,7 @@ test_branch="${2:-8.2}"
 case "$test_branch" in
     8.2) initial_version=8.2.20 target_version=8.2.35 ;;
     8.3) initial_version=8.3.8 target_version=8.3.36 ;;
-    *) echo 'Only fixture branches 8.2 and 8.3 are supported'; exit 2 ;;
+    *) echo 'Поддерживаются только тестовые ветки 8.2 и 8.3'; exit 2 ;;
 esac
 set_php_target "$test_branch"
 old_version="$initial_version"
@@ -40,7 +40,7 @@ rpm() {
       -qp)
         if [[ "$*" == *SOURCEPACKAGE* ]]; then printf '(none)'; else cat -- "$file"; fi ;;
       -K) return 0 ;;
-      *) echo "Unexpected RPM $*" >&2; return 99 ;;
+      *) echo "Неожиданный вызов RPM $*" >&2; return 99 ;;
     esac
 }
 export -f rpm
@@ -54,7 +54,7 @@ sort -o installed installed
 signer="$(gpg --with-colons --fingerprint --list-secret-keys | awk -F: '$1=="fpr"{print $10; exit}')"
 bash "$installer" --prepare-release --branch "$test_branch" --new-rpm-dir "$case_root/new-input" --old-rpm-dir "$case_root/old-input" --signer "$signer" --output "$case_root/source"
 cmp -s keyring.gpg source/release-keyring.gpg
-printf 'PASS actual publisher-produced catalogs used by client\n'
+printf 'PASS клиент использует настоящие каталоги издателя\n'
 cp installed initial
 printf 'SOURCE=%s/source\nKEYRING=%s/keyring.gpg\nHEALTH_URL=https://fixture.test/health.php\n' "$case_root" "$case_root" > client.conf
 chmod 600 client.conf
@@ -70,7 +70,7 @@ rpm() {
       -qp)
         if [[ "$*" == *SOURCEPACKAGE* ]]; then printf '(none)'; else cat -- "${@: -1}"; fi ;;
       -K) return 0 ;;
-      *) echo "Unexpected RPM $*" >&2; return 99 ;;
+      *) echo "Неожиданный вызов RPM $*" >&2; return 99 ;;
     esac
 }
 run_update() {
@@ -90,8 +90,8 @@ run_update() {
 expect_failure() {
     local label="$1"; shift
     rm -f "$case_root/result"
-    if ( "$@" ) > "$case_root/out" 2>&1; then cat "$case_root/out"; echo "FAIL accepted $label"; exit 1; fi
-    [ ! -e "$case_root/result" ] || { echo "FAIL updated $label"; exit 1; }
+    if ( "$@" ) > "$case_root/out" 2>&1; then cat "$case_root/out"; echo "FAIL принято: $label"; exit 1; fi
+    [ ! -e "$case_root/result" ] || { echo "FAIL выполнено обновление: $label"; exit 1; }
     local expected=''
     case "$label" in
       unsigned_extra) expected='Посторонний файл в каталоге RPM:' ;;
@@ -110,16 +110,16 @@ expect_failure() {
       partial_download) expected='fixture-partial-download' ;;
       missing_required_new_module) expected='Не найден подходящий RPM для php-mbstring (new).' ;;
       wrong_new_branch) expected='Не найден подходящий RPM для php (new).' ;;
-      *) echo "FAIL unknown negative fixture $label"; exit 1 ;;
+      *) echo "FAIL неизвестный отрицательный сценарий: $label"; exit 1 ;;
     esac
-    grep -Fq -- "$expected" "$case_root/out" || { cat "$case_root/out"; echo "FAIL wrong rejection for $label"; exit 1; }
-    printf 'PASS rejected %s\n' "$label"
+    grep -Fq -- "$expected" "$case_root/out" || { cat "$case_root/out"; echo "FAIL неверная причина отказа: $label"; exit 1; }
+    printf 'PASS отклонено: %s\n' "$label"
 }
 auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
 [ "$(cat result)" = updated ]
-printf 'PASS local automatic preparation and existing installer handoff\n'
+printf 'PASS локальная автоматическая подготовка и передача управления существующему установщику\n'
 
-# The OLD signature covers a fleet archive, while this host needs only three rows.
+# Подпись OLD покрывает общий архив серверов, а этому узлу нужны только три строки.
 extra="php-gd|(none)|$initial_version|1.el7|x86_64"
 extra_hash="$(printf '%s\n' "$extra" | sha256sum)"
 extra_name="php-gd-${extra_hash%% *}.rpm"
@@ -127,7 +127,7 @@ printf '%s\n' "$extra" > "source/$extra_name"
 (cd source && sha256sum "$extra_name" >> OLD-SHA256SUMS && gpg --batch --yes --armor --detach-sign --output OLD-SHA256SUMS.asc OLD-SHA256SUMS)
 auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
 [ "$(cat result)" = updated ]
-printf 'PASS absent unrelated signed OLD archive entry\n'
+printf 'PASS отсутствующий посторонний файл подписанного архива OLD\n'
 mkdir bundle
 cp source/OLD-SHA256SUMS bundle/SHA256SUMS
 cp source/OLD-SHA256SUMS.asc bundle/SHA256SUMS.asc
@@ -188,13 +188,13 @@ expect_failure partial_download auto_update_dispatch --config "$case_root/client
 rm fail-download
 auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
 [ "$(cat result)" = updated ]
-printf 'PASS fresh HTTPS retry after partial download\n'
+printf 'PASS новая попытка HTTPS после частичного скачивания\n'
 cp good.conf client.conf
 old_version="$target_version"
 rm -f keyring.gpg
 auto_update_dispatch --config "$case_root/client.conf"
 [ "$(cat result)" = already-current ]
-printf 'PASS already-target health route needs no artifacts\n'
+printf 'PASS проверка работоспособности целевой версии не требует артефактов\n'
 
 
 old_version="$initial_version"
@@ -210,14 +210,14 @@ printf '%s\n' "$required" > "source/$required_name"
     gpg --batch --yes --armor --detach-sign --output OLD-SHA256SUMS.asc OLD-SHA256SUMS)
 expect_failure missing_required_new_module auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
 grep -Fq 'Не найден подходящий RPM для php-mbstring (new).' "$case_root/out"
-printf 'PASS missing required NEW module blocks installation after exact OLD preparation\n'
+printf 'PASS отсутствие обязательного модуля NEW блокирует установку после точной подготовки OLD\n'
 
-# A custom source is literal, and even signed RPMs from another branch cannot
-# reach the updater handoff. Re-sign with this test's ephemeral fixture key.
+# Сторонний источник обрабатывается буквально, и даже подписанные RPM другой ветки не могут
+# попасть в обновление. Переподписываем временным тестовым ключом этой проверки.
 cp initial installed
 if [ "$test_branch" = 8.3 ]; then wrong_version=8.2.35; else wrong_version=8.3.36; fi
 sed -i "s/$target_version/$wrong_version/" source/php-"$target_version"-1.el7.x86_64.rpm
 (cd source && sha256sum php-"$target_version"-1.el7.x86_64.rpm php-cli-"$target_version"-1.el7.x86_64.rpm php-common-"$target_version"-1.el7.x86_64.rpm > NEW-SHA256SUMS &&
     gpg --batch --yes --armor --detach-sign --output NEW-SHA256SUMS.asc NEW-SHA256SUMS)
 expect_failure wrong_new_branch auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
-printf 'PASS signed custom release cannot switch PHP branch\n'
+printf 'PASS подписанный сторонний выпуск не может изменить ветку PHP\n'

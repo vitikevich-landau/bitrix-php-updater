@@ -1,7 +1,7 @@
-"""Contextual menu regressions against real Bash readiness and navigation.
+"""Регрессионные проверки контекстного меню с настоящими проверками готовности и навигацией Bash.
 
-Run in disposable Linux containers. PHP/RPM/Apache and child CLI operations
-are controlled boundaries; no update, service mutation or network is allowed.
+Запускать в одноразовых Linux-контейнерах. PHP/RPM/Apache и дочерние операции CLI
+подменяются на границах; обновления, изменения служб и сеть запрещены.
 """
 import codecs
 import os
@@ -20,13 +20,13 @@ import time
 installer = Path(sys.argv[1]).resolve(strict=True)
 source = installer.read_text(encoding='utf-8')
 prefix = source.split('# Мутирующие операции:', 1)[0]
-assert prefix != source, 'Installer CLI boundary missing'
-# Redirect only this filesystem boundary; the real profile check stays intact.
+assert prefix != source, 'Не найдена граница CLI установщика'
+# Перенаправляется только эта граница файловой системы; настоящая проверка профиля сохраняется.
 prefix = prefix.replace('[ -d /etc/httpd/bx ]', '[ -d "$ROOT/httpd/bx" ]')
 
 boundaries = r'''
 CURRENT=${CURRENT:-8.2.20}
-platform_check() { if [ "${BAD_PLATFORM:-0}" = 1 ]; then err 'fixture unsupported platform'; return 20; fi; }
+platform_check() { if [ "${BAD_PLATFORM:-0}" = 1 ]; then err 'тестовая неподдерживаемая платформа'; return 20; fi; }
 need() { :; }
 php() { [ "${PHP_FAIL:-0}" = 0 ] || return 1; printf '%s' "$CURRENT"; }
 httpd() {
@@ -84,31 +84,31 @@ def shell_case(name, body, expected=0):
         result = subprocess.run(['/bin/bash', str(script)], env=env,
                                 capture_output=True, text=True, timeout=8)
         report(name, result.returncode == expected,
-               f'rc={result.returncode}\n{result.stdout}\n{result.stderr}')
+               f'код={result.returncode}\n{result.stdout}\n{result.stderr}')
 
 
-# Catches trusting a successful diagnostic or checking only PHP/CLI RPMs.
+# Выявляет доверие успешной диагностике или проверку только RPM PHP/CLI.
 for name, settings, wanted, target in [
-    ('supported PHP 8.2 is ready', 'CURRENT=8.2.20', 'ready', '8.2.35'),
-    ('supported PHP 8.3 stays on its branch', 'CURRENT=8.3.8', 'ready', '8.3.36'),
-    ('old PHP requires migration plan', 'CURRENT=7.4.33', 'legacy', ''),
-    ('current PHP does not offer update', 'CURRENT=8.2.35', 'current', '8.2.35'),
-    ('newer PHP is not downgraded', 'CURRENT=8.3.37', 'newer', '8.3.36'),
-    ('unsupported PHP stays blocked', 'CURRENT=8.4.1', 'unsupported', ''),
-    ('unknown version stays blocked', 'CURRENT=8.3.36RC1', 'unknown', ''),
-    ('missing PHP stays blocked', 'PHP_FAIL=1', 'unknown', ''),
-    ('unsupported platform stays blocked', 'BAD_PLATFORM=1', 'blocked', '8.2.35'),
-    ('FPM profile stays blocked', 'BAD_APACHE=1', 'blocked', '8.2.35'),
-    ('BitrixEnv 9 stays blocked', 'ENV_VERSION=9.0', 'blocked', '8.2.35'),
-    ('mismatching php-common stays blocked', 'RPM_COMMON=8.2.19', 'blocked', '8.2.35'),
-    ('unreadable RPM database stays blocked', 'RPM_FAIL=1', 'blocked', '8.2.35'),
-    ('non-root check cannot launch preparation', 'id() { if [ "$1" = -u ]; then echo 1000; else command id "$@"; fi; }', 'needs_root', '8.2.35'),
+    ('поддерживаемый PHP 8.2 готов', 'CURRENT=8.2.20', 'ready', '8.2.35'),
+    ('поддерживаемый PHP 8.3 остаётся в своей ветке', 'CURRENT=8.3.8', 'ready', '8.3.36'),
+    ('старый PHP требует плана миграции', 'CURRENT=7.4.33', 'legacy', ''),
+    ('актуальный PHP не предлагает обновление', 'CURRENT=8.2.35', 'current', '8.2.35'),
+    ('более новый PHP не понижается', 'CURRENT=8.3.37', 'newer', '8.3.36'),
+    ('неподдерживаемый PHP остаётся заблокированным', 'CURRENT=8.4.1', 'unsupported', ''),
+    ('неизвестная версия остаётся заблокированной', 'CURRENT=8.3.36RC1', 'unknown', ''),
+    ('отсутствие PHP остаётся причиной блокировки', 'PHP_FAIL=1', 'unknown', ''),
+    ('неподдерживаемая платформа остаётся заблокированной', 'BAD_PLATFORM=1', 'blocked', '8.2.35'),
+    ('профиль FPM остаётся заблокированным', 'BAD_APACHE=1', 'blocked', '8.2.35'),
+    ('BitrixEnv 9 остаётся заблокированным', 'ENV_VERSION=9.0', 'blocked', '8.2.35'),
+    ('несовпадающий php-common остаётся причиной блокировки', 'RPM_COMMON=8.2.19', 'blocked', '8.2.35'),
+    ('недоступная база RPM остаётся причиной блокировки', 'RPM_FAIL=1', 'blocked', '8.2.35'),
+    ('проверка без root не может запустить подготовку', 'id() { if [ "$1" = -u ]; then echo 1000; else command id "$@"; fi; }', 'needs_root', '8.2.35'),
 ]:
     body = settings + '\nmenu_update_readiness\n'
-    body += f'[ "${{NEXT_STATUS:-}}" = {wanted} ] || {{ echo "unexpected readiness: ${{NEXT_STATUS:-missing}}"; exit 1; }}\n'
-    body += '[ -n "${NEXT_REASON:-}" ] || { echo "missing explanation"; exit 1; }\n'
+    body += f'[ "${{NEXT_STATUS:-}}" = {wanted} ] || {{ echo "неожиданная готовность: ${{NEXT_STATUS:-missing}}"; exit 1; }}\n'
+    body += '[ -n "${NEXT_REASON:-}" ] || { echo "отсутствует пояснение"; exit 1; }\n'
     if target:
-        body += f'[ "$NEXT_TARGET" = {target} ] || {{ echo "wrong target: $NEXT_TARGET"; exit 1; }}\n'
+        body += f'[ "$NEXT_TARGET" = {target} ] || {{ echo "неверная цель: $NEXT_TARGET"; exit 1; }}\n'
     shell_case(name, body)
 
 
@@ -124,15 +124,15 @@ STALE = '20261107T080000Z-999'
 def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected_rc=0,
              required=(), full_script=False, initial_input='', colored=(),
              env_updates=None, plain_output=False):
-    """Drive actual prompts; select displayed labels instead of fixed positions."""
+    """Отвечать на настоящие запросы; выбирать отображённые подписи, а не фиксированные позиции."""
     with tempfile.TemporaryDirectory() as directory:
         env = environment(directory)
         env.pop('NO_COLOR', None)
         env.update(env_updates or {})
         script = Path(directory) / 'case.sh'
         if full_script:
-            # Keep CLI entry, child process and metadata wiring intact. Inject
-            # external fixtures after function definitions in every process.
+            # Сохраняем точку входа CLI, дочерний процесс и передачу метаданных. Вставляем
+            # подмены внешних операций после определений функций в каждом процессе.
             content = source.replace('[ -d /etc/httpd/bx ]', '[ -d "$ROOT/httpd/bx" ]')
             content = content.replace('# Мутирующие операции:',
                                       boundaries + '\n' + setup + '\n# Мутирующие операции:', 1)
@@ -167,7 +167,7 @@ def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected
                     text = decoder.decode(chunk)
                     output += text
                     pending += text
-                    # All contextual prompts include the safe default [0].
+                    # Все контекстные запросы включают безопасный вариант по умолчанию [0].
                     if re.search(r'\[0\][^\r\n]*[:>] ?$', pending):
                         choice = queue.pop(0) if queue else '0'
                         if choice in ('0', '', 'invalid', 'EOF'):
@@ -176,25 +176,25 @@ def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected
                             matches = [(n, label) for n, label in re.findall(r'^\s*(\d+)[.)]\s*(.+)$', pending, re.M)
                                        if re.search(choice, label, re.I)]
                             if len(matches) != 1:
-                                absent.append(f'expected one option /{choice}/, found {matches}')
+                                absent.append(f'ожидался один пункт /{choice}/, найдено {matches}')
                                 answer = '0'
                             else:
                                 answer, label = matches[0]
                                 picked.append(label)
                         os.write(master, answer.encode() + (b'' if answer == '\x04' else b'\n'))
                         if full_script and answer == '0':
-                            # Return from the checks submenu, then exit main.
+                            # Возвращаемся из подменю проверок, затем выходим из главного меню.
                             os.write(master, b'0\n0\n')
                         pending = ''
                 elif child.poll() is not None:
                     break
-            # Closing the last PTY descriptor can report EIO just before the
-            # kernel marks the child exited. Allow that normal exit to finish.
+            # Закрытие последнего дескриптора PTY может вернуть EIO непосредственно перед тем,
+            # как ядро отметит завершение дочернего процесса. Даём ему завершиться штатно.
             try:
                 rc = child.wait(timeout=.5)
             except subprocess.TimeoutExpired:
                 child.kill()
-                absent.append('prompt timed out')
+                absent.append('истекло время ожидания запроса')
                 rc = child.wait()
         finally:
             if child.poll() is None:
@@ -206,19 +206,19 @@ def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected
         valid = rc == expected_rc and not absent and 'Что дальше' in output
         valid = valid and not any(re.search(item, option_labels, re.I) for item in forbidden)
         valid = valid and all(item in output for item in required)
-        # The meaning-bearing text itself must be inside the ANSI span: an
-        # unrelated colored heading must not satisfy a status-color assertion.
+        # Сам значимый текст должен находиться внутри ANSI-диапазона:
+        # посторонний цветной заголовок не должен удовлетворять проверке цвета состояния.
         for color, pattern in colored:
             spans = re.findall(rf'\x1b\[{color}m([^\x1b\r\n]*)\x1b\[0m', output)
             if not any(re.search(pattern, text, re.I) for text in spans):
-                absent.append(f'missing color {color} around /{pattern}/')
+                absent.append(f'отсутствует цвет {color} вокруг /{pattern}/')
                 valid = False
         if plain_output and '\x1b' in output:
-            absent.append('ANSI emitted with color disabled')
+            absent.append('Выведены ANSI-последовательности при отключённом цвете')
             valid = False
         if calls is not None:
             valid = valid and events.splitlines() == calls
-        report(name, valid, f'rc={rc}; issues={absent}; chosen={picked}; calls={events}\n{output}')
+        report(name, valid, f'код={rc}; ошибки={absent}; выбрано={picked}; вызовы={events}\n{output}')
 
 
 child_stub = r'''
@@ -229,32 +229,32 @@ menu_invoke() {
 }
 '''
 
-# These exercise the real renderer in a terminal. Missing semantic color,
-# wrong severity, or coloring only the heading must fail these cases.
-pty_case('current PHP explanation is green', 'CURRENT=8.2.35\n' + child_stub,
+# Проверяется настоящий вывод в терминале. Отсутствие цвета по смыслу,
+# неверная важность или окраска только заголовка должны приводить к провалу проверок.
+pty_case('пояснение об актуальном PHP отображается зелёным', 'CURRENT=8.2.35\n' + child_stub,
          'menu_action --check', forbidden=[AUTO],
          colored=[(32, r'уже установлена|не требуется')])
-pty_case('available preparation is yellow while update is pending', child_stub,
+pty_case('доступная подготовка отображается жёлтым, пока обновление ожидается', child_stub,
          'menu_action --check', colored=[(33, r'подготовк.*обновления')])
 for action, pattern in [('--check-site', r'Проверка.*сайта.*пройдена'),
                         ('--setup-update', r'Настройки.*сохранены')]:
-    pty_case(action + ' successful outcome is green', child_stub,
+    pty_case(action + ': успешный результат отображается зелёным', child_stub,
              'menu_action ' + action, colored=[(32, pattern)])
 
 for setting, pattern in [('BAD_APACHE=1', r'mod_php'),
                          ('RPM_COMMON=8.2.19', r'Пакеты PHP.*не согласованы')]:
-    pty_case(setting + ' blocked explanation is red', setting + '\n' + child_stub,
+    pty_case(setting + ': причина блокировки отображается красным', setting + '\n' + child_stub,
              'menu_action --check', forbidden=[AUTO], colored=[(31, pattern)])
 
 for setting in ['PHP_FAIL=1', 'CURRENT=8.3.36RC1']:
-    pty_case(setting + ' unknown PHP explanation is yellow', setting + '\n' + child_stub,
+    pty_case(setting + ': пояснение о неизвестном PHP отображается жёлтым', setting + '\n' + child_stub,
              'menu_action --check', forbidden=[AUTO],
              colored=[(33, r'Версия PHP не определена')])
 
 for action, pattern in [('--check-site', r'Проверка сайта отменена'),
                         ('--setup-update', r'Настройка отменена'),
                         ('--update', r'Операция отменена')]:
-    pty_case(action + ' cancellation is yellow', child_stub.replace('return 0', 'return 12'),
+    pty_case(action + ': отмена отображается жёлтым', child_stub.replace('return 0', 'return 12'),
              'menu_action ' + action, colored=[(33, pattern)])
 
 for state, rc, color, pattern in [
@@ -267,24 +267,24 @@ for state, rc, color, pattern in [
     ('started', 0, 33, r'Подготовка операции'),
 ]:
     state_stub = child_stub.replace("MENU_STATE=''", 'MENU_STATE=' + state)
-    pty_case(state + ' operation summary uses semantic color',
+    pty_case(state + ': сводка операции использует цвет по смыслу',
              state_stub.replace('return 0', f'return {rc}'),
              'menu_action --update', colored=[(color, pattern)])
 
-pty_case('error and warning prefixes receive red and yellow', child_stub,
+pty_case('префиксы ошибки и предупреждения отображаются красным и жёлтым', child_stub,
          "err color-error; warn color-warning; menu_action --check",
          colored=[(31, 'ОШИБКА: color-error'), (33, 'ВНИМАНИЕ: color-warning')])
-pty_case('failed operation without metadata is red',
+pty_case('неудачная операция без метаданных отображается красным',
          child_stub.replace('return 0', 'return 51'), 'menu_action --update',
          colored=[(31, r'Операция остановлена')])
 
 for settings in [{'NO_COLOR': '1'}, {'TERM': 'dumb'}]:
-    pty_case(str(settings) + ' disables terminal color', 'CURRENT=8.2.35\n' + child_stub,
+    pty_case(str(settings) + ' отключает цвет в терминале', 'CURRENT=8.2.35\n' + child_stub,
              'err color-error; warn color-warning; menu_action --check',
              env_updates=settings, plain_output=True,
              required=['ОШИБКА: color-error', 'ВНИМАНИЕ: color-warning'])
 
-shell_case('captured messages preserve streams and prefixes without ANSI', r'''
+shell_case('перехваченные сообщения сохраняют потоки и префиксы без ANSI', r'''
 err color-error > "$OUTPUT" 2> "$ROOT/errors"
 warn color-warning >> "$OUTPUT" 2>> "$ROOT/errors"
 [ ! -s "$OUTPUT" ] || exit 1
@@ -297,9 +297,9 @@ menu_next_actions --check 0 <<< 0 >> "$OUTPUT"
 case "$(cat "$OUTPUT" "$ROOT/errors")" in *$'\033'*) exit 1 ;; esac
 ''')
 
-# Catches broken wiring between the real manual menu, internal CLI result
-# channel, site selection and a subsequent child process. Only external site
-# discovery/probing and the final update boundary are replaced here.
+# Выявляет нарушения связи между настоящим ручным меню, внутренним каналом результата CLI,
+# выбором сайта и следующим дочерним процессом. Подменяются только внешние
+# поиск и проверка сайта, а также конечный вызов обновления.
 end_to_end = r'''
 discover_managed_sites() {
     MANAGED_SITE_CANDIDATES=('http|other.example|80|/home/bitrix/other' 'https|shop.example|443|/home/bitrix/site with spaces')
@@ -317,24 +317,24 @@ auto_update_dispatch() {
     return 80
 }
 '''
-pty_case('full menu carries selected site through real child result channel',
+pty_case('полное меню передаёт выбранный сайт через настоящий канал результата дочернего процесса',
          end_to_end, '', [AUTO], full_script=True, initial_input='1\n5\n2\n',
          calls=['PROBE|8.2.20|' + SITE, 'AUTO|--site|' + SITE],
          required=['Выберите сайт для временной проверки PHP', 'FIXTURE_AUTO_STOP',
                    'Операция остановлена'])
 
-# Child work is replaced to avoid system mutation; the real chooser decides the
-# next command, arguments and safe default. Wrong routing changes recorded calls.
-pty_case('ready quick check continues to auto-update', child_stub,
+# Работа дочернего процесса подменяется во избежание изменений системы; настоящий выбор определяет
+# следующую команду, аргументы и безопасный вариант. Неверный маршрут меняет записанные вызовы.
+pty_case('успешная быстрая проверка позволяет перейти к автоматическому обновлению', child_stub,
          'menu_action --check', [AUTO], calls=['CALL|--check', 'CALL|--auto-update'])
-pty_case('diagnostic rc zero does not authorize blocked profile', 'BAD_APACHE=1\n' + child_stub,
+pty_case('нулевой код диагностики не разрешает заблокированный профиль', 'BAD_APACHE=1\n' + child_stub,
          'menu_action --check', forbidden=[AUTO], calls=['CALL|--check'], required=['mod_php'])
-pty_case('legacy PHP continues to migration plan', 'CURRENT=7.4.33\n' + child_stub,
+pty_case('старый PHP позволяет перейти к плану миграции', 'CURRENT=7.4.33\n' + child_stub,
          'menu_action --check', [PLAN], forbidden=[AUTO], calls=['CALL|--check', 'CALL|--plan'])
-pty_case('already-current PHP has no auto-update shortcut', 'CURRENT=8.2.35\n' + child_stub,
+pty_case('для актуального PHP нет перехода к автоматическому обновлению', 'CURRENT=8.2.35\n' + child_stub,
          'menu_action --check', forbidden=[AUTO], calls=['CALL|--check'])
 for action in ['--plan', '--audit --offline', '--setup-update']:
-    pty_case(action + ' exposes explicit preparation shortcut', child_stub,
+    pty_case(action + ' предлагает явный переход к подготовке', child_stub,
              'menu_action ' + action, [AUTO],
              calls=['CALL|' + action.replace(' ', '|'), 'CALL|--auto-update'])
 
@@ -345,30 +345,30 @@ bash() {
     printf 'CALL' >> "$EVENTS"; printf '|%s' "$@" >> "$EVENTS"; printf '\n' >> "$EVENTS"
 }
 '''
-pty_case('audit follow-up opens report selection and returns to next actions', comparison_stub,
+pty_case('после аудита выбор отчётов возвращает к дальнейшим действиям', comparison_stub,
          'menu_action --audit --offline', ['Сравнить.*отчёты'],
          calls=['CALL|--audit|--offline', 'CALL|--compare-menu'])
 
 for action, summary in [('--check-site', 'Проверка сайта отменена'),
                         ('--setup-update', 'Настройка отменена')]:
     cancelled = child_stub.replace('return 0', 'return 12')
-    pty_case(action + ' cancellation is explained before next choices', cancelled,
+    pty_case(action + ': отмена объясняется до выбора дальнейших действий', cancelled,
              'menu_action ' + action, calls=['CALL|' + action], required=[summary])
 
 site_stub = child_stub.replace("MENU_SITE=''", 'MENU_SITE=' + shlex.quote(SITE))
-pty_case('site continuation preserves exact descriptor', site_stub,
+pty_case('продолжение после проверки сайта сохраняет точный дескриптор', site_stub,
          'menu_action --check-site', [AUTO],
          calls=['CALL|--check-site', 'CALL|--auto-update|--site|' + SITE])
 
 site_once = child_stub.replace('    return 0',
                                '    [ "$1" != --check-site ] || MENU_SITE=' + shlex.quote(SITE) + '\n    return 0')
-pty_case('viewing plan preserves selected site for update', site_once,
+pty_case('просмотр плана сохраняет выбранный сайт для обновления', site_once,
          'menu_action --check-site', [PLAN, AUTO],
          calls=['CALL|--check-site', 'CALL|--plan', 'CALL|--auto-update|--site|' + SITE])
 
 failed_web = site_once.replace('    return 0',
                                '    if [ "$1" = --check-site ]; then MENU_WEB=failed; return 85; fi\n    return 0')
-pty_case('failed web check remains blocked after viewing plan', failed_web,
+pty_case('неудачная проверка сайта остаётся заблокированной после просмотра плана', failed_web,
          'menu_action --check-site', [PLAN], forbidden=[AUTO],
          calls=['CALL|--check-site', 'CALL|--plan'],
          colored=[(31, r'PHP сайта.*не подтверждён')])
@@ -383,7 +383,7 @@ menu_invoke() {{
     return 51
 }}
 '''
-pty_case('failed preparation never offers stale rollback', failed_prepare,
+pty_case('неудачная подготовка не предлагает откат устаревшего сеанса', failed_prepare,
          'menu_action --auto-update', forbidden=[ROLLBACK], calls=['CALL|--auto-update'])
 
 def saved_session(state, session=ORIGINAL):
@@ -399,47 +399,47 @@ chmod 600 "$UPDATER_STATE/sessions/{session}/state"
 precheck = saved_session('precheck_failed') + child_stub.replace(
     "MENU_SESSION='' MENU_STATE=''", f'MENU_SESSION={ORIGINAL} MENU_STATE=precheck_failed')
 precheck = precheck.replace('return 0', 'return 61')
-pty_case('failed precheck with own session has no rollback', precheck,
+pty_case('неудачная предварительная проверка со своим сеансом не предлагает откат', precheck,
          'menu_action --update', forbidden=[ROLLBACK], calls=['CALL|--update'], required=[ORIGINAL])
 
 for state, result in [('completed', 0), ('installation_failed', 62), ('verify_failed', 64)]:
     transaction = saved_session(state) + child_stub.replace(
         "MENU_SESSION='' MENU_STATE=''", f'MENU_SESSION={ORIGINAL} MENU_STATE={state}')
     transaction = transaction.replace('return 0', f'return {result}')
-    pty_case('own update rollback after ' + state, transaction,
+    pty_case('откат собственного обновления после ' + state, transaction,
              'menu_action --auto-update', [ROLLBACK],
              calls=['CALL|--auto-update', 'CALL|--rollback|--session|' + ORIGINAL], required=[ORIGINAL])
 
 rollback = child_stub.replace("MENU_SESSION='' MENU_STATE='' MENU_ORIGIN=''",
                               f'MENU_SESSION={ATTEMPT} MENU_STATE=rollback_failed MENU_ORIGIN={ORIGINAL}')
 rollback = rollback.replace('return 0', 'return 72')
-pty_case('failed rollback retries original update ID', saved_session('verify_failed') + rollback,
+pty_case('повтор неудачного отката использует исходный идентификатор обновления', saved_session('verify_failed') + rollback,
          f'menu_action --rollback --session {ORIGINAL}', [ROLLBACK],
          calls=['CALL|--rollback|--session|' + ORIGINAL] * 2, required=[ORIGINAL])
 
-for label, answer, rc in [('Enter', '', 0), ('back', '0', 0), ('EOF', 'EOF', 1),
-                          ('invalid choice', 'invalid', 0)]:
-    pty_case(label + ' never starts mutation', child_stub, 'menu_action --check', [answer],
+for label, answer, rc in [('Enter', '', 0), ('возврат', '0', 0), ('EOF', 'EOF', 1),
+                          ('неверный выбор', 'invalid', 0)]:
+    pty_case(label + ' никогда не запускает изменения', child_stub, 'menu_action --check', [answer],
              calls=['CALL|--check'], expected_rc=rc)
 
-shell_case('metadata channel disabled for ordinary CLI', r'''
+shell_case('канал метаданных отключён для обычного CLI', r'''
 MENU_RESULT_ENABLED=0
 menu_record session 20261108T100000Z-111 3> "$OUTPUT" || exit 1
 [ ! -s "$OUTPUT" ]
 ''')
-shell_case('metadata channel carries literal values without evaluation', r'''
+shell_case('канал метаданных передаёт буквальные значения без вычисления', r'''
 MENU_RESULT_ENABLED=1
 value='http|site.test|80|/site with spaces/$(touch /root/should-never-exist)'
 menu_record site "$value" 3> "$OUTPUT"
 [ "$(cat "$OUTPUT")" = "$(printf 'site\t%s' "$value")" ] && [ ! -e /root/should-never-exist ]
 ''')
-shell_case('child metadata resets stale session before failed preparation', r'''
+shell_case('метаданные дочернего процесса сбрасывают устаревший сеанс до неудачной подготовки', r'''
 MENU_SESSION=20261107T080000Z-999 MENU_STATE=completed MENU_ORIGIN=20261107T080000Z-999 MENU_SITE=stale
 bash() { return 51; }
 menu_invoke --auto-update; rc=$?
 [ "$rc" = 51 ] && [ -z "$MENU_SESSION$MENU_STATE$MENU_ORIGIN$MENU_SITE" ]
 ''')
-shell_case('child metadata parsed literally and only from private channel', r'''
+shell_case('метаданные дочернего процесса разбираются буквально и только из закрытого канала', r'''
 bash() {
     [ "$1" = "$SELF" ] && [ "$2" = --menu-action ] && [ "$3" = --check-site ] || return 99
     printf 'session\t20261108T100000Z-111\nstate\tcompleted\n' >&3
@@ -452,12 +452,12 @@ menu_invoke --check-site || exit 1
 [ "$MENU_SESSION" = 20261108T100000Z-111 ] && [ "$MENU_STATE" = completed ] &&
 [ "$MENU_SITE" = 'http|site.test|80|/site with spaces/$(touch '"$ROOT"'/injected)' ] && [ ! -e "$ROOT/injected" ]
 ''')
-shell_case('result channel rejects injected multiline records', r'''
+shell_case('канал результата отклоняет внедрённые многострочные записи', r'''
 MENU_RESULT_ENABLED=1
 menu_record site $'/site\nsession\t20261107T080000Z-999' 3> "$OUTPUT"
 ! grep -q '^session' "$OUTPUT"
 ''')
-shell_case('new session and state publish their own metadata', r'''
+shell_case('новый сеанс и состояние публикуют собственные метаданные', r'''
 MENU_RESULT_ENABLED=1
 UPDATER_STATE="$ROOT/state" UPDATER_LOG="$ROOT/logs" WORK_ROOT="$ROOT/work"
 exec 3> "$OUTPUT"
@@ -467,7 +467,7 @@ exec 3>&-
 grep -Fx "$(printf 'session\t%s' "$SESSION_NAME")" "$OUTPUT" &&
 grep -Fx "$(printf 'state\tverify_failed')" "$OUTPUT"
 ''')
-shell_case('status identifies original update behind last rollback attempt',
+shell_case('состояние определяет исходное обновление для последней попытки отката',
            saved_session('verify_failed') + saved_session('rollback_failed', ATTEMPT) + f'''
 printf '%s\\n' {ORIGINAL} > "$UPDATER_STATE/sessions/{ATTEMPT}/rollback-of"
 chmod 600 "$UPDATER_STATE/sessions/{ATTEMPT}/rollback-of"
@@ -479,7 +479,7 @@ grep -Fx "$(printf 'session\\t{ATTEMPT}')" "$OUTPUT" &&
 grep -Fx "$(printf 'origin\\t{ORIGINAL}')" "$OUTPUT"
 ''')
 
-# Public CLI must remain noninteractive even if stdin is a terminal or has input.
+# Публичный CLI не должен запрашивать ввод, даже если stdin — терминал или содержит данные.
 with tempfile.TemporaryDirectory() as directory:
     php = Path(directory) / 'php'
     php.write_text('#!/bin/sh\nprintf 8.4.1\n')
@@ -487,9 +487,9 @@ with tempfile.TemporaryDirectory() as directory:
     result = subprocess.run(['/bin/bash', str(installer), '--check'], input='1\n',
                             capture_output=True, text=True, timeout=5,
                             env=dict(os.environ, PATH=directory + ':' + os.environ['PATH']))
-    report('ordinary CLI check has no follow-up prompt', result.returncode == 0 and
+    report('обычная проверка CLI не запрашивает дальнейшие действия', result.returncode == 0 and
            'Выберите действие' not in result.stdout and 'Что дальше' not in result.stdout,
            result.stdout + result.stderr)
 
-print(f'{total - failed}/{total} contextual action cases passed')
+print(f'{total - failed}/{total} проверок контекстных действий пройдено')
 raise SystemExit(bool(failed))

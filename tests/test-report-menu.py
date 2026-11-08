@@ -1,7 +1,7 @@
-"""Report selection/comparison through the real Bash -> Python terminal path.
+"""Выбор и сравнение отчётов через настоящий терминальный вызов Bash -> Python.
 
-Run in a disposable Linux container. Fixtures never invoke a diagnostic or an
-update; report menus and --compare only read the deliberately supplied JSON.
+Запускать в одноразовом Linux-контейнере. Тестовые данные не запускают диагностику или
+обновление; меню отчётов и --compare только читают специально переданные JSON.
 """
 import json
 import os
@@ -126,7 +126,7 @@ def pty_case(name, setup, inputs, check, env=None):
         rc, output, timeout = fixture.tty(inputs(fixture) if callable(inputs) else inputs, env)
         unchanged = all(p.read_bytes() == data for p, data in before.items())
         valid = rc == 0 and not timeout and 'Traceback' not in output and unchanged and check(output)
-        report(name, valid, f'rc={rc}, timeout={timeout}, unchanged={unchanged}\n{output}')
+        report(name, valid, f'код={rc}, время_истекло={timeout}, без_изменений={unchanged}\n{output}')
 
 
 def compared(output):
@@ -137,16 +137,16 @@ def pair_changed(output):
     return compared(output) and re.search(r'PHP CLI[^\r\n]*8\.2\.20[^\r\n]*8\.2\.35', output)
 
 
-pty_case('empty discovery explains how to create reports', lambda f: None, '0\n',
+pty_case('отсутствие отчётов сопровождается пояснением об их создании', lambda f: None, '0\n',
          lambda out: not compared(out) and re.search(r'аудит|диагностик', out, re.I))
-pty_case('one report cannot become a fabricated comparison',
+pty_case('единственный отчёт не создаёт ложное сравнение',
          lambda f: f.save('only.json', diagnostic('2026-11-08T10:00:00Z')), '1\n0\n',
          lambda out: not compared(out) and re.search(r'два|двух|пары|пара|недостаточно', out, re.I))
-pty_case('latest pair is selected without filename input', lambda f: f.pair(), '1\n0\n', pair_changed)
-pty_case('manual before and after selections use numbers', lambda f: f.pair(), '2\n2\n1\n0\n', pair_changed)
-pty_case('script directory reports are discovered from a different cwd',
+pty_case('последняя пара выбирается без ввода имён файлов', lambda f: f.pair(), '1\n0\n', pair_changed)
+pty_case('ручной выбор отчётов до и после использует номера', lambda f: f.pair(), '2\n2\n1\n0\n', pair_changed)
+pty_case('отчёты рядом со скриптом обнаруживаются из другого рабочего каталога',
          lambda f: f.pair(f.script_dir), '1\n0\n', pair_changed)
-pty_case('home directory reports are discovered', lambda f: f.pair(f.home), '1\n0\n', pair_changed)
+pty_case('отчёты из домашнего каталога обнаруживаются', lambda f: f.pair(f.home), '1\n0\n', pair_changed)
 
 
 def chronology(f):
@@ -155,7 +155,7 @@ def chronology(f):
     os.utime(path, (2000000000, 2000000000))
 
 
-pty_case('latest means report timestamps rather than filename or mtime', chronology, '1\n0\n',
+pty_case('последние отчёты определяются по времени внутри отчёта, а не имени или mtime', chronology, '1\n0\n',
          lambda out: pair_changed(out) and not re.search(r'PHP CLI[^\r\n]*8\.2\.1\b', out))
 
 
@@ -165,10 +165,10 @@ def mixed_servers(f):
     f.save('foreign-after.json', diagnostic('2026-11-08T12:00:00Z', php='8.3.36', host='foreign.example'))
 
 
-pty_case('latest shortcut prefers the current host without mixing servers', mixed_servers, '1\n0\n',
+pty_case('выбор последней пары предпочитает текущий узел и не смешивает серверы', mixed_servers, '1\n0\n',
          lambda out: pair_changed(out) and not re.search(r'PHP CLI[^\r\n]*8\.3\.', out))
-pty_case('manual after list excludes different servers', mixed_servers, '2\n4\n1\n0\n', pair_changed)
-pty_case('one foreign server pair can be selected automatically',
+pty_case('ручной список отчётов после исключает другие серверы', mixed_servers, '2\n4\n1\n0\n', pair_changed)
+pty_case('единственная пара другого сервера может выбираться автоматически',
          lambda f: f.pair(host='copied-server.example'), '1\n0\n', pair_changed)
 
 
@@ -178,7 +178,7 @@ def ambiguous_hosts(f):
     f.save('b-after.json', diagnostic('2026-11-08T12:00:00Z', host='server-b.example'))
 
 
-pty_case('ambiguous foreign hosts require explicit report selection', ambiguous_hosts, '1\n0\n',
+pty_case('несколько других узлов требуют явного выбора отчёта', ambiguous_hosts, '1\n0\n',
          lambda out: not compared(out) and re.search(r'выбер|выбор', out, re.I))
 
 
@@ -187,7 +187,7 @@ def same_date(f):
     f.save('two.json', diagnostic('2026-11-08T10:00:00Z'))
 
 
-pty_case('same-date duplicates do not become before and after', same_date, '1\n0\n',
+pty_case('дубликаты с одинаковой датой не становятся парой до и после', same_date, '1\n0\n',
          lambda out: not compared(out))
 
 
@@ -204,7 +204,7 @@ def invalid_files(f):
     (f.cwd / 'alias.json').symlink_to(f.cwd / 'before with spaces.json')
 
 
-pty_case('invalid fallback and special JSON files cannot block valid reports', invalid_files,
+pty_case('некорректные, сокращённые и специальные JSON-файлы не блокируют корректные отчёты', invalid_files,
          '1\n0\n', lambda out: pair_changed(out) and re.search(r'пропущ|неподход|не удалось|сокращ', out, re.I))
 
 
@@ -214,7 +214,7 @@ def incomplete_report(f):
                               'timestamp_utc': '2026-11-09T10:00:00Z', 'alerts': []})
 
 
-pty_case('incomplete diagnostics cannot displace a valid latest pair', incomplete_report,
+pty_case('неполная диагностика не вытесняет корректную последнюю пару', incomplete_report,
          '1\n0\n', pair_changed)
 
 
@@ -225,7 +225,7 @@ def large_file(f):
     f.save('too-large.json', obj)
 
 
-pty_case('oversized reports are ignored before JSON loading', large_file, '1\n0\n', pair_changed)
+pty_case('слишком большие отчёты пропускаются до загрузки JSON', large_file, '1\n0\n', pair_changed)
 
 
 def other_directory(f):
@@ -234,16 +234,16 @@ def other_directory(f):
     f.pair(f.other)
 
 
-pty_case('other directory with spaces requires no filenames', other_directory,
+pty_case('другой каталог с пробелами не требует ввода имён файлов', other_directory,
          lambda f: '3\n' + str(f.other) + '\n1\n0\n', pair_changed)
-pty_case('Enter returns safely without choosing a report', lambda f: f.pair(), '\n',
+pty_case('Enter безопасно возвращает без выбора отчёта', lambda f: f.pair(), '\n',
          lambda out: not compared(out))
-pty_case('EOF leaves the report menu without spinning', lambda f: f.pair(), '\x04',
+pty_case('EOF завершает меню отчётов без зацикливания', lambda f: f.pair(), '\x04',
          lambda out: not compared(out))
-pty_case('invalid menu number can be corrected', lambda f: f.pair(), '999\n1\n0\n', pair_changed)
-pty_case('NO_COLOR disables all comparison ANSI escapes', lambda f: f.pair(), '1\n0\n',
+pty_case('неверный номер меню можно исправить', lambda f: f.pair(), '999\n1\n0\n', pair_changed)
+pty_case('NO_COLOR отключает все ANSI-последовательности сравнения', lambda f: f.pair(), '1\n0\n',
          lambda out: pair_changed(out) and '\x1b' not in out, {'NO_COLOR': '1'})
-pty_case('dumb terminals receive readable plain comparison', lambda f: f.pair(), '1\n0\n',
+pty_case('терминалы dumb получают читаемое сравнение без оформления', lambda f: f.pair(), '1\n0\n',
          lambda out: pair_changed(out) and '\x1b' not in out, {'TERM': 'dumb'})
 
 
@@ -265,7 +265,7 @@ def alert_colors(out):
             re.search(r'\x1b\[33m[^\x1b]*Новое предупреждение[^\x1b]*\x1b\[0m', out))
 
 
-pty_case('resolved new and remaining alerts have readable colored titles', changed_alerts,
+pty_case('устранённые, новые и оставшиеся предупреждения имеют читаемые цветные заголовки', changed_alerts,
          '1\n0\n', alert_colors)
 
 
@@ -276,7 +276,7 @@ def scope_change(f):
     f.save('after.json', diagnostic('2026-11-08T10:00:00Z'))
 
 
-pty_case('different diagnostic scopes explain disappearing alerts', scope_change, '1\n0\n',
+pty_case('разный объём диагностики объясняет исчезновение предупреждений', scope_change, '1\n0\n',
          lambda out: compared(out) and re.search(r'условия|режим', out, re.I) and
          not re.search(r'\x1b\[32m[^\x1b]*Обновление найдено', out))
 
@@ -286,7 +286,7 @@ def severity_change(f):
     f.save('after.json', diagnostic('2026-11-08T10:00:00Z', alerts=[alert('SAME', 'critical', 'Стало критично')]))
 
 
-pty_case('same alert code becoming critical remains visible in red', severity_change, '1\n0\n',
+pty_case('предупреждение с тем же кодом при переходе в критическое остаётся видимым красным', severity_change, '1\n0\n',
          lambda out: compared(out) and re.search(r'\x1b\[31m[^\x1b]*Стало критично', out))
 
 
@@ -295,7 +295,7 @@ def terminal_controls(f):
     f.save('after.json', diagnostic('2026-11-08T10:00:00Z', alerts=[alert('TERM', 'warning', 'escape\x1b[2J\ncontrol')]))
 
 
-pty_case('report strings cannot inject terminal control sequences', terminal_controls, '1\n0\n',
+pty_case('строки отчёта не могут внедрять управляющие последовательности терминала', terminal_controls, '1\n0\n',
          lambda out: compared(out) and '\x1b[2J' not in out and 'escape' in out, {'NO_COLOR': '1'})
 
 
@@ -318,7 +318,7 @@ def json_contract(f):
             result['changes'] == [{'component': 'PHP CLI', 'before': '8.2.20', 'after': '8.2.35'}], out)
 
 
-cli_case('existing compare JSON interface remains compatible', json_contract)
+cli_case('существующий JSON-интерфейс сравнения сохраняет совместимость', json_contract)
 
 
 def reject_server_mix(f):
@@ -330,7 +330,7 @@ def reject_server_mix(f):
     return rc != 0 and 'Traceback' not in out and re.search(r'разн.*сервер', out, re.I), out
 
 
-cli_case('CLI rejects reports from different servers clearly', reject_server_mix)
+cli_case('CLI понятно отклоняет отчёты разных серверов', reject_server_mix)
 
 
 def reject_malformed(f):
@@ -340,7 +340,7 @@ def reject_malformed(f):
     return rc != 0 and 'Traceback' not in out and re.search(r'ошиб|некоррект|отчёт', out, re.I), out
 
 
-cli_case('malformed diagnostic schema produces a useful error rather than traceback', reject_malformed)
+cli_case('некорректная схема диагностики выдаёт понятную ошибку без трассировки', reject_malformed)
 
 
 def reject_incomplete(f):
@@ -351,7 +351,7 @@ def reject_incomplete(f):
     return rc != 0 and 'Traceback' not in out and '[OK]' not in out, out
 
 
-cli_case('missing diagnostic sections cannot produce a green CLI summary', reject_incomplete)
+cli_case('отсутствующие разделы диагностики не позволяют вывести зелёную сводку CLI', reject_incomplete)
 
 
 def no_python(f):
@@ -366,6 +366,6 @@ fallback_diagnose() { echo UNEXPECTED_FALLBACK_DIAGNOSIS; return 99; }
     return valid, repr(outputs)
 
 
-cli_case('without Python both comparison modes explain the missing dependency', no_python)
-print(f'{total - failed}/{total} report comparison tests passed', flush=True)
+cli_case('без Python оба режима сравнения объясняют отсутствие зависимости', no_python)
+print(f'{total - failed}/{total} проверок сравнения отчётов пройдено', flush=True)
 sys.exit(bool(failed))

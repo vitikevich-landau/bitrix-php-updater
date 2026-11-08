@@ -1,21 +1,23 @@
-# Build/source regressions
+# Регрессионные проверки сборки и исходников
 
-The tests accept a complete installer plus both original SRPMs as arguments. They
-contain no workstation paths, downloads, signing keys, or production installs.
-Keep `test-build-sources.sh` beside `check-ffi-el7.sh`, and keep
-`test-build-dispatch.py` beside `dispatch-entry.sh`.
+Тесты принимают полную версию установщика и оба исходных SRPM как аргументы.
+В них нет путей рабочей станции, скачивания файлов, ключей подписи или установки
+на рабочий сервер. Файл `test-build-sources.sh` должен находиться рядом
+с `check-ffi-el7.sh`, а `test-build-dispatch.py` — рядом с `dispatch-entry.sh`.
 
-Run only in a disposable CentOS 7 x86_64 Docker container. Every test requires
-`BITRIX_TEST_DISPOSABLE=1` and `/.dockerenv`. Mount the installer and inputs read
-only, keep network disabled during the tests, and give each invocation a fresh
-writable scratch directory. The container root filesystem can remain read only;
-`/tmp` and `/var/tmp` must be writable.
+Запускайте только в одноразовом контейнере Docker с CentOS 7 x86_64.
+Каждый тест требует `BITRIX_TEST_DISPOSABLE=1` и `/.dockerenv`. Подключайте
+установщик и входные файлы только для чтения, отключайте сеть на время тестов
+и выделяйте каждому запуску новый рабочий каталог с правом записи.
+Корневая файловая система контейнера может оставаться доступной только
+для чтения; `/tmp` и `/var/tmp` должны быть доступны для записи.
 
-Required source tools: Bash 4.2, RPM 4.11 (`rpm-build`, including `rpmspec`), cpio,
-GnuPG 2.0, tar/xz, patch, diffutils, coreutils, awk, grep, sed and GCC with EL7
-glibc headers. The dispatch test additionally needs Python 2.7 or Python 3 and
-all dependencies in the adapted PHP specs. Its disk-space guard needs at least
-8,000 MiB free; a 12 GiB `/tmp` tmpfs satisfies this without reserving all memory.
+Для проверки исходников нужны Bash 4.2, RPM 4.11 (`rpm-build`, включая `rpmspec`),
+cpio, GnuPG 2.0, tar/xz, patch, diffutils, coreutils, awk, grep, sed и GCC
+с заголовочными файлами glibc из EL7. Проверка диспетчера дополнительно требует
+Python 2.7 или Python 3 и все зависимости из адаптированных файлов спецификаций
+PHP. Проверка свободного места требует не менее 8000 МиБ; tmpfs объёмом 12 ГиБ
+для `/tmp` удовлетворяет этому условию, не резервируя весь объём памяти.
 
 ```bash
 export BITRIX_TEST_DISPOSABLE=1
@@ -27,21 +29,25 @@ python tests/build-sources/test-build-dispatch.py \
   /input/php-8.3.36-1.remi.src.rpm /tmp/dispatch-check
 ```
 
-The source test executes real hash checks, SRPM extraction, GPG verification,
-patch generation and `%prep` for both branches. It compiles the actual three FFI
-directive comparisons with EL7 headers, rejects corrupt/wrong-branch SRPMs before
-payload inspection, and checks pinned signing identities. For the identity
-negative cases only, a test wrapper runs genuine GPG first, then substitutes a
-disallowed signer/primary fingerprint at that boundary.
+Проверка исходников выполняет настоящее сравнение хешей, извлечение SRPM,
+проверку GPG, создание патчей и `%prep` для обеих веток. Она компилирует три
+сравнения директив FFI из настоящего кода с заголовочными файлами EL7,
+отклоняет повреждённые SRPM и SRPM другой ветки до разбора содержимого
+и проверяет закреплённые ключи подписи. Только в отрицательных сценариях
+проверки ключей тестовая обвязка сначала запускает настоящий GPG,
+а затем подменяет отпечаток подписавшего или основного ключа на недопустимый.
 
-The dispatch test loads all definitions from the supplied full installer, invokes
-its real `updater_dispatch`, and uses real pseudo-terminal confirmation, session
-creation, source preparation and dependency checks. Only `rpmbuild -ba` is
-replaced. The resulting artifact says `TEST ONLY` and is not an installable RPM.
-It tests missing `--builder`, noninteractive invocation, declined confirmation,
-unsupported branch, wrong-branch SRPM, explicit 8.3, and default 8.2 behavior.
-These tests do not claim a real PHP compilation or runtime update/rollback.
+Проверка диспетчера загружает все определения из переданного полного установщика,
+вызывает его настоящий `updater_dispatch` и использует настоящие подтверждение
+через псевдотерминал, создание сессии, подготовку исходников и проверку
+зависимостей. Подменяется только `rpmbuild -ba`. Полученный файл содержит метку
+`ТОЛЬКО ДЛЯ ТЕСТА` и не является RPM, пригодным для установки. Проверяются отсутствие
+`--builder`, запуск без терминала, отказ при подтверждении, неподдерживаемая
+ветка, SRPM другой ветки, явный выбор 8.3 и выбор 8.2 по умолчанию.
+Эти тесты не подтверждают настоящую компиляцию PHP, обновление или откат
+установленных пакетов.
 
-`red-base83.sh` reproduces the historical rc9 failure after supplying the approved
-8.3 profile as a standalone fixture. `check-ffi-el7.sh` also runs independently on
-an extracted `ext/ffi/ffi.c` to demonstrate the unpatched EL7 compiler failure.
+`red-base83.sh` воспроизводит историческую ошибку rc9 после передачи утверждённого
+профиля 8.3 в виде отдельных тестовых данных. `check-ffi-el7.sh` также можно
+запустить отдельно для извлечённого `ext/ffi/ffi.c`, чтобы показать ошибку
+компилятора EL7 на исходном коде без патча.

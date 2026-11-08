@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Confirmation regressions using real Bash PTYs, compatible with Python 2.7/3.
+"""Регрессионные проверки подтверждений в настоящих Bash PTY, совместимые с Python 2.7/3.
 
-Run in Linux with an installer path. Python bootstrap uses the normal command
-entry point but stops at its first mkdir after consent. No download, runtime
-installation, package operation or service restart is performed.
+Запускать в Linux с путём к установщику. Установка Python использует обычную точку
+входа команды, но останавливается на первом mkdir после согласия. Скачивание, установка
+среды, операции с пакетами и перезапуск служб не выполняются.
 """
 from __future__ import print_function, unicode_literals
 
@@ -49,7 +49,7 @@ def write_text(path, text):
 
 
 def run_process(command, env, answers, tty=True):
-    """Send cooked-terminal input, including explicit EOF when requested."""
+    """Передать ввод в построчном режиме терминала, включая явный EOF при необходимости."""
     payload = answers.encode('utf-8')
     if not tty:
         child = subprocess.Popen(command, stdin=subprocess.PIPE,
@@ -93,20 +93,20 @@ def run_process(command, env, answers, tty=True):
         os.close(master)
     output = b''.join(chunks).decode('utf-8', 'replace')
     if timed_out:
-        output += '\nTEST TIMEOUT'
+        output += '\nИСТЕКЛО ВРЕМЯ ПРОВЕРКИ'
     return child.returncode, output
 
 
 def main():
     if len(sys.argv) != 2:
-        sys.exit('Usage: python test-confirmations.py /path/install.sh')
+        sys.exit('Использование: python test-confirmations.py /path/install.sh')
     installer = os.path.abspath(sys.argv[1])
     with io.open(installer, encoding='utf-8') as source:
         text = source.read()
     marker = '# Мутирующие операции:'
-    assert marker in text, 'Installer CLI boundary missing'
+    assert marker in text, 'Не найдена граница CLI установщика'
     found = re.findall(r"^\s*confirm_phrase '[^']*' '([^']+)'", text, re.M)
-    assert set(found) == set(PHRASES), 'Review coverage for changed confirmation phrases'
+    assert set(found) == set(PHRASES), 'Проверьте покрытие изменённых фраз подтверждения'
     directory = tempfile.mkdtemp(prefix='confirmation-tests-')
     failed = 0
     total = 0
@@ -116,7 +116,7 @@ def main():
         env_file = os.path.join(directory, 'bootstrap-env.sh')
         write_text(library, text.split(marker, 1)[0])
         write_text(env_file, '''
-# Keep the complete --bootstrap-python entry point and stop before any writes.
+# Сохраняем полную точку входа --bootstrap-python и останавливаемся до любых записей.
 id() { printf '4242\\n'; }
 mkdir() { printf 'CONSENT_BOUNDARY\\n'; return 87; }
 curl() { printf 'UNEXPECTED_DOWNLOAD\\n'; return 88; }
@@ -140,70 +140,70 @@ curl() { printf 'UNEXPECTED_DOWNLOAD\\n'; return 88; }
             valid = valid and output.count('> ') >= min_prompts
             print(('PASS ' if valid else 'FAIL ') + name)
             if not valid:
-                print('exit', result, 'expected', expected)
+                print('код завершения', result, 'ожидался', expected)
                 print(output[-1400:])
             return not valid
 
-        # Every existing action accepts Russian and Linux-style approvals.
+        # Каждое существующее действие принимает русские подтверждения и обычные для Linux ответы.
         for phrase in PHRASES:
-            body = "confirm_phrase 'Fixture action' " + shell_quote(phrase)
+            body = "confirm_phrase 'Тестовое действие' " + shell_quote(phrase)
             for answer in ['да', 'Y', 'YeS', phrase, phrase.lower(), phrase.title()]:
-                failed += check('action ' + phrase + ' accepts ' + repr(answer),
+                failed += check('действие ' + phrase + ' принимает ' + repr(answer),
                                 body, answer + '\n', 0)
                 total += 1
 
-        body = "confirm_phrase 'Fixture action' 'ОБНОВИТЬ PHP'"
+        body = "confirm_phrase 'Тестовое действие' 'ОБНОВИТЬ PHP'"
         for answer in YES:
-            failed += check('generic approval ' + repr(answer), body, answer + '\n', 0)
+            failed += check('обычное подтверждение ' + repr(answer), body, answer + '\n', 0)
             total += 1
         for answer in NO:
-            failed += check('generic decline ' + repr(answer), body, answer + '\n', 12)
+            failed += check('обычный отказ ' + repr(answer), body, answer + '\n', 12)
             total += 1
         for answers, expected in [('maybe\ny\n', 0), ('maybe\nNo\n', 12),
                                   ('yess\nДА\n', 0), ('давай\nнет\n', 12)]:
-            failed += check('invalid answer reprompts ' + repr(answers), body,
+            failed += check('неверный ответ вызывает повторный запрос ' + repr(answers), body,
                             answers, expected, required=('Введите',), min_prompts=2)
             total += 1
-        for name, answers, tty in [('terminal EOF', '\x04', True),
-                                   ('partial yes then EOF', 'y\x04\x04', True),
-                                   ('piped yes', 'y\n', False)]:
+        for name, answers, tty in [('EOF терминала', '\x04', True),
+                                   ('неполный ответ yes, затем EOF', 'y\x04\x04', True),
+                                   ('ответ yes через канал', 'y\n', False)]:
             failed += check(name, body, answers, 12, tty=tty)
             total += 1
 
         sequence = """
-confirm_phrase 'First action' 'СНИМОК ПРОВЕРЕН' || exit $?
+confirm_phrase 'Первое действие' 'СНИМОК ПРОВЕРЕН' || exit $?
 printf 'FIRST_APPROVED\\n'
-confirm_phrase 'Second action' 'ОБНОВИТЬ PHP' || exit $?
+confirm_phrase 'Второе действие' 'ОБНОВИТЬ PHP' || exit $?
 printf 'BOTH_APPROVED\\n'
 """
         for name, answers, expected, required, forbidden in [
-                ('two approvals', 'y\nда\n', 0, ('BOTH_APPROVED',), ()),
-                ('decline second', 'yes\nn\n', 12, ('FIRST_APPROVED',), ('BOTH_APPROVED',)),
-                ('EOF second', 'ДА\n\x04', 12, ('FIRST_APPROVED',), ('BOTH_APPROVED',)),
-                ('decline first', 'N\ny\n', 12, (), ('FIRST_APPROVED', 'BOTH_APPROVED'))]:
+                ('два подтверждения', 'y\nда\n', 0, ('BOTH_APPROVED',), ()),
+                ('отказ от второго действия', 'yes\nn\n', 12, ('FIRST_APPROVED',), ('BOTH_APPROVED',)),
+                ('EOF при втором действии', 'ДА\n\x04', 12, ('FIRST_APPROVED',), ('BOTH_APPROVED',)),
+                ('отказ от первого действия', 'N\ny\n', 12, (), ('FIRST_APPROVED', 'BOTH_APPROVED'))]:
             failed += check(name, sequence, answers, expected, required, forbidden)
             total += 1
 
-        # Normal bootstrap dispatch, guarded at the first post-consent write.
+        # Обычный запуск установки Python с остановкой перед первой записью после согласия.
         for answer in YES:
-            failed += check('bootstrap approval ' + repr(answer), '', answer + '\n',
+            failed += check('подтверждение установки Python ' + repr(answer), '', answer + '\n',
                             5, ('CONSENT_BOUNDARY',), ('UNEXPECTED_DOWNLOAD',), bootstrap=True)
             total += 1
         for answer in NO:
-            failed += check('bootstrap decline ' + repr(answer), '', answer + '\n',
+            failed += check('отказ от установки Python ' + repr(answer), '', answer + '\n',
                             4, forbidden=('CONSENT_BOUNDARY', 'UNEXPECTED_DOWNLOAD'), bootstrap=True)
             total += 1
         for name, answers, expected, required, forbidden, tty in [
-                ('bootstrap invalid then yes', 'maybe\nДа\n', 5, ('CONSENT_BOUNDARY',), (), True),
-                ('bootstrap invalid then no', 'maybe\nNO\n', 4, ('Введите',), ('CONSENT_BOUNDARY',), True),
-                ('bootstrap EOF', '\x04', 4, (), ('CONSENT_BOUNDARY',), True),
-                ('bootstrap partial yes EOF', 'y\x04\x04', 4, (), ('CONSENT_BOUNDARY',), True),
-                ('bootstrap piped yes', 'y\n', 5, ('интерактив',), ('CONSENT_BOUNDARY',), False)]:
+                ('установка Python: неверный ответ, затем согласие', 'maybe\nДа\n', 5, ('CONSENT_BOUNDARY',), (), True),
+                ('установка Python: неверный ответ, затем отказ', 'maybe\nNO\n', 4, ('Введите',), ('CONSENT_BOUNDARY',), True),
+                ('установка Python: EOF', '\x04', 4, (), ('CONSENT_BOUNDARY',), True),
+                ('установка Python: неполный yes и EOF', 'y\x04\x04', 4, (), ('CONSENT_BOUNDARY',), True),
+                ('установка Python: yes через канал', 'y\n', 5, ('интерактив',), ('CONSENT_BOUNDARY',), False)]:
             failed += check(name, '', answers, expected, required, forbidden,
                             tty=tty, bootstrap=True,
-                            min_prompts=2 if 'invalid' in name else 0)
+                            min_prompts=2 if 'неверный' in name else 0)
             total += 1
-        print('{0}/{1} confirmation cases passed'.format(total - failed, total))
+        print('{0}/{1} проверок подтверждения пройдено'.format(total - failed, total))
         return bool(failed)
     finally:
         shutil.rmtree(directory)

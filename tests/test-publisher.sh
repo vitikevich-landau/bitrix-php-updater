@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Run only inside the disposable container described in README.md.
-# RPM metadata is mocked; GnuPG signatures and digest checks are real.
-installer="$(readlink -f -- "${1:?Usage: test-publisher.sh INSTALLER}")"
+# Запускать только внутри одноразового контейнера, описанного в README.md.
+# Метаданные RPM подменены; подписи GnuPG и проверки хешей настоящие.
+installer="$(readlink -f -- "${1:?Использование: test-publisher.sh INSTALLER}")"
 test -f "$installer"
 root="$(mktemp -d)"
 trap 'rm -rf -- "$root"' EXIT
@@ -48,40 +48,40 @@ done
 expected="$(printf 'php|(none)|8.2.20|1.el7.remi|x86_64\n' | sha256sum | cut -d' ' -f1)"
 test -f "$root/dist/php-$expected.rpm"
 test "$(find "$root/dist" -type f | wc -l)" -eq 13
-printf 'PASS actual RSA signatures, exported public key, canonical OLD name and exact asset list\n'
-if run_publish "$root/dist" > "$root/out" 2>&1; then echo 'overwrote output'; exit 1; fi
+printf 'PASS настоящие подписи RSA, экспорт открытого ключа, каноническое имя OLD и точный список файлов\n'
+if run_publish "$root/dist" > "$root/out" 2>&1; then echo 'выходные данные перезаписаны'; exit 1; fi
 grep -Fq 'Каталог выпуска уже существует.' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS existing output rejected\n'
+printf 'PASS существующие выходные данные отклонены\n'
 cp "$root/new/php-8.2.35-1.el7.custom.x86_64.rpm" "$root/new/php-other.rpm"
-if run_publish "$root/duplicate" > "$root/out" 2>&1; then echo 'accepted duplicate'; exit 1; fi
+if run_publish "$root/duplicate" > "$root/out" 2>&1; then echo 'принят дубликат'; exit 1; fi
 test ! -e "$root/duplicate"
 rm "$root/new/php-other.rpm"
 grep -Fq 'Новый комплект должен содержать по одному RPM' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS duplicate NEW package rejected and output absent\n'
+printf 'PASS повторяющийся пакет NEW отклонён, выходных данных нет\n'
 mv "$root/new/php-common-8.2.35-1.el7.custom.x86_64.rpm" "$root/common"
-if run_publish "$root/missing" > "$root/out" 2>&1; then echo 'accepted missing core'; exit 1; fi
+if run_publish "$root/missing" > "$root/out" 2>&1; then echo 'принято отсутствие основного пакета'; exit 1; fi
 mv "$root/common" "$root/new/php-common-8.2.35-1.el7.custom.x86_64.rpm"
 grep -Fq 'В новом комплекте отсутствует php-common.' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS missing required NEW package rejected\n'
+printf 'PASS отсутствие обязательного пакета NEW отклонено\n'
 ln -s "$root/new/php-8.2.35-1.el7.custom.x86_64.rpm" "$root/new/link.rpm"
-if run_publish "$root/link" > "$root/out" 2>&1; then echo 'accepted symlink'; exit 1; fi
+if run_publish "$root/link" > "$root/out" 2>&1; then echo 'принята символическая ссылка'; exit 1; fi
 rm "$root/new/link.rpm"
 grep -Fq 'В исходном каталоге найден посторонний файл или ссылка' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS symlink RPM rejected\n'
+printf 'PASS символическая ссылка на RPM отклонена\n'
 printf 'source\n' >> "$root/new/php-8.2.35-1.el7.custom.x86_64.rpm"
-if run_publish "$root/source" > "$root/out" 2>&1; then echo 'accepted SRPM'; exit 1; fi
+if run_publish "$root/source" > "$root/out" 2>&1; then echo 'принят SRPM'; exit 1; fi
 sed -i '$d' "$root/new/php-8.2.35-1.el7.custom.x86_64.rpm"
 grep -Fq 'Нужен целый бинарный RPM' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS source RPM rejected\n'
+printf 'PASS RPM с исходниками отклонён\n'
 cp "$root/old/php-8.2.20-1.el7.remi.x86_64.rpm" "$root/old/conflict.rpm"
 printf 'different payload\n' >> "$root/old/conflict.rpm"
-if run_publish "$root/conflict" > "$root/out" 2>&1; then echo 'accepted conflicting contents'; exit 1; fi
+if run_publish "$root/conflict" > "$root/out" 2>&1; then echo 'принято конфликтующее содержимое'; exit 1; fi
 rm "$root/old/conflict.rpm"
 grep -Fq 'Одинаковая NEVRA имеет разное содержимое' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS conflicting OLD artifact rejected\n'
-if run_publish "$root/old/nested" > "$root/out" 2>&1; then echo 'accepted nested output'; exit 1; fi
+printf 'PASS конфликтующий артефакт OLD отклонён\n'
+if run_publish "$root/old/nested" > "$root/out" 2>&1; then echo 'принят вложенный выходной каталог'; exit 1; fi
 grep -Fq 'Каталог выпуска должен находиться вне исходных каталогов RPM.' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS output inside input rejected\n'
+printf 'PASS выходной каталог внутри входного отклонён\n'
 
 
 cat > "$root/bin/gpg" <<'EOF'
@@ -90,27 +90,27 @@ if [[ "$*" == *--detach-sign* && "$*" == *OLD-SHA256SUMS* ]]; then echo 'fixture
 exec /usr/bin/gpg "$@"
 EOF
 chmod +x "$root/bin/gpg"
-if run_publish "$root/signfail" > "$root/out" 2>&1; then echo 'accepted failed signature'; exit 1; fi
+if run_publish "$root/signfail" > "$root/out" 2>&1; then echo 'принята неудачная подпись'; exit 1; fi
 test ! -e "$root/signfail"
-if compgen -G "$root/.signfail.*" >/dev/null; then echo 'partial signing output retained'; exit 1; fi
+if compgen -G "$root/.signfail.*" >/dev/null; then echo 'частичные результаты подписи сохранены'; exit 1; fi
 rm "$root/bin/gpg"
 grep -Fq 'fixture-second-signature-failure' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS second-signature failure cleans staging and publishes nothing\n'
+printf 'PASS сбой второй подписи очищает подготовленные данные и ничего не публикует\n'
 printf 'private material\n' > "$root/new/private-key.txt"
-if run_publish "$root/unexpected" > "$root/out" 2>&1; then echo 'accepted unrelated input'; exit 1; fi
+if run_publish "$root/unexpected" > "$root/out" 2>&1; then echo 'приняты посторонние входные данные'; exit 1; fi
 test ! -e "$root/unexpected"
 rm "$root/new/private-key.txt"
 grep -Fq 'В исходном каталоге найден посторонний файл или ссылка' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS unrelated input rejected\n'
+printf 'PASS посторонние входные данные отклонены\n'
 saved="$signer"
 signer=0000000000000000000000000000000000000000
-if run_publish "$root/wrongkey" > "$root/out" 2>&1; then echo 'accepted wrong key'; exit 1; fi
+if run_publish "$root/wrongkey" > "$root/out" 2>&1; then echo 'принят неверный ключ'; exit 1; fi
 test ! -e "$root/wrongkey"
 signer="$saved"
 grep -Fq 'Закрытый ключ подписи не найден' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS unavailable signer rejected\n'
+printf 'PASS недоступный ключ подписи отклонён\n'
 
-# PHP 8.3 is a separate signed release. Old artifacts must stay on its branch.
+# PHP 8.3 — отдельный подписанный выпуск. Старые артефакты должны оставаться в его ветке.
 mkdir "$root/new83" "$root/old83"
 for name in php php-cli php-common; do
     printf '%s|(none)|8.3.36|1.el7.custom|x86_64\n' "$name" > "$root/new83/$name.rpm"
@@ -124,13 +124,13 @@ for kind in NEW OLD; do
     gpgv --homedir "$root/verify" --keyring "$root/dist83/release-keyring.gpg" "$root/dist83/$kind-SHA256SUMS.asc" "$root/dist83/$kind-SHA256SUMS"
     (cd "$root/dist83"; sha256sum --status -c "$kind-SHA256SUMS")
 done
-printf 'PASS branch 8.3 produces verified NEW and OLD catalogs\n'
-if publish83 "$root/old" "$root/crossbranch" > "$root/out" 2>&1; then echo 'accepted cross-branch OLD'; exit 1; fi
+printf 'PASS ветка 8.3 создаёт проверенные каталоги NEW и OLD\n'
+if publish83 "$root/old" "$root/crossbranch" > "$root/out" 2>&1; then echo 'принят OLD другой ветки'; exit 1; fi
 test ! -e "$root/crossbranch"
 grep -Fq 'Неподходящий пакет для выпуска EL7 PHP 8.3' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS branch 8.3 rejects 8.2 OLD archive before publication\n'
+printf 'PASS ветка 8.3 отклоняет архив OLD от 8.2 до публикации\n'
 sed -i s/8.3.36/8.3.35/ "$root/new83/php.rpm"
-if publish83 "$root/old83" "$root/wrongpatch" > "$root/out" 2>&1; then echo 'accepted wrong NEW patch'; exit 1; fi
+if publish83 "$root/old83" "$root/wrongpatch" > "$root/out" 2>&1; then echo 'принята неверная версия исправления NEW'; exit 1; fi
 test ! -e "$root/wrongpatch"
 grep -Fq 'Новый комплект должен содержать по одному RPM 8.3.36' "$root/out" || { cat "$root/out"; exit 1; }
-printf 'PASS branch 8.3 requires exact target patch in NEW archive\n'
+printf 'PASS ветка 8.3 требует точной целевой версии исправления в архиве NEW\n'

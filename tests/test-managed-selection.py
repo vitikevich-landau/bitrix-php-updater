@@ -9,7 +9,7 @@ import time
 installer = os.path.abspath(sys.argv[1])
 prefix = '''
 source <(sed '/^# Мутирующие операции:/,$d' "$1")
-err() { printf 'ERROR: %s\\n' "$*" >&2; }
+err() { printf 'ОШИБКА: %s\\n' "$*" >&2; }
 discover_managed_sites() {
   MANAGED_SITE_CANDIDATES=('http|one.example|8888|/srv/one' 'http|two.example|8888|/srv/two')
   MANAGED_SITE_LABELS=('one.example:8888 /srv/one' 'two.example:8888 /srv/two')
@@ -21,12 +21,12 @@ printf '\\nRESULT:%s:%s\\n' "$result" "$MANAGED_SITE"
 exit "$result"
 '''
 for name, answer, unattended, expected_rc, expected_site in [
-    ('choose second', b'2\n', '0', 0, 'http|two.example|8888|/srv/two'),
-    ('choose first', b'1\n', '0', 0, 'http|one.example|8888|/srv/one'),
-    ('empty cancels', b'\n', '0', 12, ''),
-    ('EOF cancels', b'\x04', '0', 12, ''),
-    ('invalid number rejects', b'3\n', '0', 83, ''),
-    ('unattended terminal stays noninteractive', None, '1', 83, ''),
+    ('выбор второго сайта', b'2\n', '0', 0, 'http|two.example|8888|/srv/two'),
+    ('выбор первого сайта', b'1\n', '0', 0, 'http|one.example|8888|/srv/one'),
+    ('пустой ввод отменяет выбор', b'\n', '0', 12, ''),
+    ('EOF отменяет выбор', b'\x04', '0', 12, ''),
+    ('неверный номер отклоняется', b'3\n', '0', 83, ''),
+    ('терминал в автоматическом режиме не запрашивает ввод', None, '1', 83, ''),
 ]:
     master, slave = pty.openpty()
     child = subprocess.Popen(['bash', '-c', prefix, 'fixture', installer, unattended], stdin=slave, stdout=slave, stderr=slave)

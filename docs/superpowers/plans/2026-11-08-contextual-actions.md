@@ -1,60 +1,61 @@
-# Contextual next actions implementation plan
+# План реализации контекстных действий «Что дальше»
 
-> **For agentic workers:** Use superpowers:executing-plans for implementation; independent test/documentation assistance and a final fresh review.
+> **Для агентов-исполнителей:** при реализации используйте superpowers:executing-plans; поручите независимым помощникам тесты и документацию, затем проведите отдельную итоговую проверку.
 
-**Goal:** Let an administrator move from diagnostics to update through contextual choices without searching manual menus.
-**Architecture:** A shared interactive action loop wraps existing CLI commands; structured readiness and a private result descriptor carry context, never authorize bypassing guards.
-**Tech Stack:** Bash 4.2, embedded Python, Python PTY regression tests, disposable Docker containers.
-**Spec:** docs/superpowers/specs/2026-11-08-contextual-actions-design.md
+**Цель:** позволить администратору переходить от диагностики к обновлению через контекстные действия без поиска в ручных меню.
+**Архитектура:** общий интерактивный цикл действий вызывает существующие команды; структурированная оценка готовности и закрытый дескриптор результата передают контекст, но не разрешают обходить защитные проверки.
+**Технологии:** Bash 4.2, встроенный Python, регрессионные тесты на Python с псевдотерминалом, одноразовые контейнеры Docker.
+**Спецификация:** docs/superpowers/specs/2026-11-08-contextual-actions-design.md
 
-## Global Constraints
+## Общие ограничения
 
-- Preserve manual menu numbers, existing CLI behavior and all update/rollback guards.
-- Enter/0 go back; EOF exits; updates and rollback always require explicit selection.
-- Readiness is not inferred from diagnostic exit code or severity.
-- Selected site is revalidated; stale session data never triggers recovery of another operation.
-- No production-server update or network access in automated tests.
+- Сохранить номера ручных меню, существующее поведение командной строки и все защитные проверки обновления и отката.
+- Enter/0 возвращают назад; EOF завершает работу; обновление и откат всегда требуют явного выбора.
+- Готовность нельзя выводить из кода завершения диагностики или уровня предупреждений.
+- Выбранный сайт проверяется повторно; устаревшие данные сессии никогда не запускают восстановление другой операции.
+- Автоматизированные тесты не обновляют рабочие серверы и не обращаются к сети.
 
-## Review Focus
+## На что обратить внимание при проверке
 
-- A zero diagnostic exit code with unsupported profile must not offer update.
-- A failed update before session creation must not expose rollback of an older session.
-- Site descriptors containing spaces must survive navigation without eval or word splitting.
-- EOF/Enter/invalid choices must never select an update or recovery action.
-- Failed rollback retains the original update ID, not the rollback attempt ID.
+- Нулевой код завершения диагностики при неподдерживаемом профиле не должен открывать переход к обновлению.
+- Сбой обновления до создания сессии не должен предлагать откат более старой сессии.
+- Описания сайта с пробелами должны сохраняться при навигации без eval и разбиения на слова.
+- EOF/Enter/неверный выбор никогда не должны выбирать обновление или восстановление.
+- При неудачном откате сохраняется идентификатор исходного обновления, а не попытки отката.
 
-### Task 1: Contextual menu behavior and regression tests
+### Задача 1: Контекстное меню и регрессионные тесты
 
-**Files:** install.sh; tests/test-menu.py; tests/test-next-actions.py.
-**Interfaces:** menu_update_readiness sets NEXT_STATUS/NEXT_REASON/NEXT_VERSION/NEXT_TARGET;
-menu_action runs an existing CLI action and loops over follow-ups; menu_record writes
-allowed result records only when internal --menu-action mode is enabled on fd 3.
+**Файлы:** install.sh; tests/test-menu.py; tests/test-next-actions.py.
+**Интерфейсы:** menu_update_readiness задаёт NEXT_STATUS/NEXT_REASON/NEXT_VERSION/NEXT_TARGET;
+menu_action запускает существующую команду и повторяет цикл следующих действий;
+menu_record записывает разрешённые результаты в файловый дескриптор 3 только
+при включённом внутреннем режиме --menu-action.
 
-- [x] Add failing readiness and PTY navigation tests, including the five review cases.
-- [x] Run new tests against the baseline; confirm missing behavior causes failures.
-- [x] Implement readiness, result metadata and iterative follow-up actions in install.sh.
-- [x] Wire existing checks/plan/site/setup/update/status/rollback menu entries without renumbering.
-- [x] Run new tests, existing menu/confirmation/integration/branch tests in disposable containers.
+- [x] Добавить падающие тесты готовности и навигации через псевдотерминал, включая пять сценариев проверки выше.
+- [x] Запустить новые тесты на исходной версии; подтвердить, что сбои вызваны отсутствием нужного поведения.
+- [x] Реализовать оценку готовности, сведения о результате и цикл следующих действий в install.sh.
+- [x] Подключить существующие пункты проверки, плана, сайта, настройки, обновления, состояния и отката, сохранив их номера.
+- [x] Запустить новые тесты и существующие проверки меню, подтверждений, интеграции и веток в одноразовых контейнерах.
 
-### Task 2: Documentation and complete validation
+### Задача 2: Документация и полная проверка
 
-**Files:** README.md; README.txt; tests/README.md.
-**Interfaces:** document the implemented menu labels and guarantees from Task 1.
+**Файлы:** README.md; README.txt; tests/README.md.
+**Интерфейсы:** описать реализованные названия пунктов меню и гарантии из задачи 1.
 
-- [x] Explain the beginner path, contextual actions, safe default and preparation vs installation.
-- [x] Add test instructions and coverage description.
-- [x] Run Bash syntax/ShellCheck and relevant published regression suites on Bash 4.2 and Python 3.
-- [x] Request independent review of the complete diff; address actionable defects with regression tests.
-- [x] Report actual checks and limitations; leave the changes reviewable in the current checkout.
+- [x] Объяснить маршрут для новичка, контекстные действия, безопасный выбор по умолчанию и различие подготовки и установки.
+- [x] Добавить инструкции запуска тестов и описание проверяемого поведения.
+- [x] Проверить синтаксис Bash, запустить ShellCheck и соответствующие опубликованные регрессионные наборы на Bash 4.2 и Python 3.
+- [x] Запросить независимую проверку всех изменений; устранить подтверждённые дефекты и добавить регрессионные тесты.
+- [x] Сообщить о выполненных проверках и ограничениях; оставить изменения доступными для проверки в текущей рабочей копии.
 
-## Execution record
+## Журнал выполнения
 
-- User authorized implementation; no additional design/plan approval requested.
-- Working in current clean checkout on codex/contextual-next-actions, so files remain visible to user.
-- Baseline: 29 menu cases and 100 confirmation cases pass in python:3.11-slim.
-- RED: initial contextual tests failed against the original installer because readiness/navigation were absent.
-- Final Python-container validation: contextual actions 45/45 (including real full-script child/PTY flow), manual menu 29/29, confirmations 100/100, setup 18/18, integration 25/25, branches 59/59, site selection 6/6.
-- CentOS 7 / Bash 4.2: syntax, publisher, publisher-client for both branches, environment, discovery, startup and 100 confirmation cases passed.
-- ShellCheck has the same 12 existing warnings as HEAD (SC1007 x8, SC2174 x2, SC2190 x2); no new warning category/count.
-- Independent review found no functional/security blocker. Its two UX findings were addressed: cancelled site/setup actions now report cancellation (two RED-to-GREEN regressions); confirmation wording correctly separates backup from update/restart.
-- Actual RPM installation and real HTTP-probe acceptance were not repeated: external operations are isolated in these navigation tests; clone-server acceptance remains separate.
+- Пользователь разрешил реализацию; дополнительное согласование проекта и плана не запрашивалось.
+- Работа выполняется в текущей чистой рабочей копии на ветке codex/contextual-next-actions, чтобы файлы оставались видны пользователю.
+- Исходная версия: 29 сценариев меню и 100 сценариев подтверждений проходят в python:3.11-slim.
+- Начальные контекстные тесты завершились ошибками на исходном установщике, поскольку оценка готовности и навигация отсутствовали.
+- Итоговая проверка в контейнере Python: контекстные действия 45/45 (включая настоящий дочерний запуск полного скрипта через псевдотерминал), ручное меню 29/29, подтверждения 100/100, настройка 18/18, интеграция 25/25, ветки 59/59, выбор сайта 6/6.
+- CentOS 7 / Bash 4.2: успешно проверены синтаксис, подготовка выпуска, клиентская подготовка обеих веток, окружение, обнаружение сайтов, запуск Apache и 100 сценариев подтверждений.
+- ShellCheck показывает те же 12 существующих предупреждений, что и HEAD (SC1007 ×8, SC2174 ×2, SC2190 ×2); новых категорий и дополнительных предупреждений нет.
+- Независимая проверка не выявила блокирующих проблем функциональности или безопасности. Два замечания об удобстве использования устранены: отменённые проверки сайта и настройки теперь сообщают об отмене (два регрессионных теста сначала воспроизвели сбой, затем прошли); формулировки подтверждений разделяют резервное копирование и обновление с перезапуском.
+- Установка настоящих RPM и приёмочные проверки настоящей HTTP-пробы повторно не выполнялись: внешние операции изолированы в этих тестах навигации; приёмочные испытания на клоне сервера остаются отдельным этапом.

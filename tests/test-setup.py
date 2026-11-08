@@ -1,7 +1,7 @@
-"""Noninteractive setup tests in isolated /root directories.
+"""Проверки настройки без диалога в изолированных каталогах /root.
 
-Discovery, downloads and the HTTP probe are boundary doubles. Only the copied
-test function uses a fixture key hash. No release key is read.
+Поиск, скачивание и HTTP-проба подменяются на границах. Только скопированная
+тестовая функция использует хеш тестового ключа. Ключ выпуска не читается.
 """
 import hashlib
 import os
@@ -15,9 +15,9 @@ import tempfile
 
 installer = Path(sys.argv[1]).resolve(strict=True).read_text(encoding='utf-8')
 marker = '# Мутирующие операции:'
-assert marker in installer, 'installer dispatch marker not found'
+assert marker in installer, 'не найден маркер диспетчера установщика'
 prefix = installer.split(marker, 1)[0]
-assert 'setup_auto_update() (' in prefix, 'setup function not found'
+assert 'setup_auto_update() (' in prefix, 'не найдена функция настройки'
 setup_function = prefix.split('setup_auto_update() (', 1)[1]
 project_source = 'https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.2.35-el7-r1'
 original_key_hash = re.search(r"local expected_key='([0-9a-f]{64})'", setup_function).group(1)
@@ -128,17 +128,17 @@ exit $?
         code=child.returncode
         try:
             if scenario in ('fresh','php83','explicit_site','existing_saved_site','interactive_existing_site','existing_custom_source','reuse_pinned_key'):
-                assert code==0, f'exit {code}'
+                assert code==0, f'код завершения {code}'
                 data=dict(line.split('=',1) for line in config.read_text().splitlines())
                 wanted_source = 'https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.3.36-el7-r1' if scenario == 'php83' else project_source
-                assert data['SOURCE']==wanted_source, 'wrong project branch or custom source paired with project key'
+                assert data['SOURCE']==wanted_source, 'неверная ветка проекта или сторонний источник связан с ключом проекта'
                 assert data['HEALTH_URL']=='auto'
                 expected_site = other_record if scenario in ('explicit_site','existing_saved_site') else site_record
                 assert data['SITE']==expected_site
-                assert probe.read_text().strip()==expected_site, 'saved site differs from checked site'
+                assert probe.read_text().strip()==expected_site, 'сохранённый сайт отличается от проверенного'
                 selection_lines=selection.read_text().splitlines()
-                assert selection_lines[1]==('0' if scenario=='interactive_existing_site' else '1'), 'wrong selection mode'
-                if scenario=='interactive_existing_site': assert selection_lines[0]=='', 'interactive setup reused previous site'
+                assert selection_lines[1]==('0' if scenario=='interactive_existing_site' else '1'), 'неверный режим выбора'
+                if scenario=='interactive_existing_site': assert selection_lines[0]=='', 'интерактивная настройка повторно использовала прежний сайт'
                 if scenario=='explicit_site': assert selection_lines[0]=='other.example'
                 if scenario=='existing_saved_site': assert selection_lines[0]==other_record
                 savedkey=Path(data['KEYRING'])
@@ -147,7 +147,7 @@ exit $?
                 assert stat.S_IMODE(savedkey.stat().st_mode)==0o600
                 assert stat.S_IMODE(keydir.stat().st_mode)==0o700
             else:
-                assert code!=0, 'expected refusal'
+                assert code!=0, 'ожидался отказ'
                 expected = {
                     'wrong_key_preserves': 'Публичный ключ не совпадает',
                     'failed_health': 'Автоматическая проверка сайта не пройдена',
@@ -161,15 +161,15 @@ exit $?
                     'unsafe_pinned_key': 'Небезопасный файл публичного ключа',
                     'corrupt_pinned_key': 'Сохранённый ключ выпуска повреждён',
                 }[scenario]
-                assert expected in output.decode(errors='replace'), 'wrong rejection branch: ' + expected
+                assert expected in output.decode(errors='replace'), 'неверная ветка отказа: ' + expected
                 if original:
-                    assert config.read_text()==original, 'existing config changed on failed setup'
-                    assert oldkey.read_bytes()==b'previous custom trusted key bytes', 'existing trusted key changed on failed setup'
+                    assert config.read_text()==original, 'существующая конфигурация изменилась при неудачной настройке'
+                    assert oldkey.read_bytes()==b'previous custom trusted key bytes', 'существующий доверенный ключ изменился при неудачной настройке'
                 else:
-                    assert not config.exists(), 'configuration created on refusal'
-            print('PASS',scenario)
+                    assert not config.exists(), 'при отказе создана конфигурация'
+            print('PASS сценарий',scenario)
         except AssertionError as error:
             failures+=1
-            print('FAIL',scenario, str(error))
+            print('FAIL сценарий',scenario, str(error))
             print(output.decode(errors='replace')[-1400:])
 raise SystemExit(bool(failures))

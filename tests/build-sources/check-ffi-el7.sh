@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compile the actual three FFI directive comparisons against EL7 glibc headers.
+# Компилируем три настоящих сравнения директив FFI с заголовками glibc EL7.
 set -o pipefail
 [[ $# == 2 ]] || exit 2
 sourcefile="$1"

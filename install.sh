@@ -15,8 +15,8 @@ SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SO
 
 help_ru() { update_help; }
 
-# Private, opt-in channel to the interactive parent. Never parse human output or
-# source these records; ordinary CLI invocations cannot enable it via environment.
+# Закрытый канал к родительскому интерактивному процессу включается явно. Нельзя
+# разбирать обычный вывод или исполнять эти записи; переменные окружения его не включают.
 menu_record() {
     [ "$MENU_RESULT_ENABLED" = 1 ] || return 0
     case "$1" in site|session|state|origin|web) ;; *) return 0 ;; esac
@@ -241,7 +241,7 @@ fallback_diagnose() {
     bitrix='не обнаружен'
     [ -d /etc/httpd/bx ] || [ -d /home/bitrix/www/bitrix ] && bitrix='обнаружен (версия не проверена)'
     hostname_local="$(hostname 2>/dev/null || printf 'unknown')"
-    # Escapes JSON without requiring Python or jq.
+    # Экранируем JSON без Python и jq.
     json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"; printf '%s' "$s" | tr -d '\000-\037'; }
     local output
     output="$(printf '{"schema":"bitrix-server-master/fallback-v1","version":"%s","hostname":"%s","os":"%s","architecture":"%s","php_cli":"%s","bitrix":"%s","apache":"%s","nginx":"%s","root_free":"%s","mem_available":"%s","limited":true,"readonly":true,"web_php_confirmed":false,"update_status":"unknown"}' \
@@ -652,7 +652,7 @@ legacy_php_profile() {
 
 show_legacy_php_plan() {
     local cli="$1" bx detail version='' package='' nevra='' route=migrate
-    local package_menu='4. Update packages on host' php_menu='8. Update PHP and MySQL' menu_step=5 php_target=''
+    local package_menu='4. Update packages on host (обновление пакетов на узле)' php_menu='8. Update PHP and MySQL (обновление PHP и MySQL)' menu_step=5 php_target=''
     if [[ "$cli" =~ ^[[:alnum:]_.+~-]+$ ]]; then
         status_line info "PHP CLI — $cli."
     else
@@ -696,27 +696,27 @@ EOF
         return
     fi
     cat <<'EOF'
-3. На клоне установите доступные для текущего PHP обновления ядра Битрикса, модулей и сторонних решений из Marketplace. Оцените совместимость пользовательского кода и расширений со следующей веткой PHP.
+3. На клоне установите доступные для текущего PHP обновления ядра Битрикса, модулей и сторонних решений из Маркетплейса. Оцените совместимость пользовательского кода и расширений со следующей веткой PHP.
    Подготовка к PHP 8 описана в курсе Bitrix https://dev.1c-bitrix.ru/learning/course/?COURSE_ID=48&LESSON_ID=9685
 4. Проверьте штатный Apache/mod_php, подписи, наличие RPM и разрешимость всех зависимостей для выбранной версии и промежуточных шагов. Проверьте репозитории ОС, Bitrix, Remi и прочие источники, нужные вашей конфигурации. Публичные репозитории Remi для EL7 закрыты. При отсутствии проверенного полного набора пакетов выберите перенос на поддерживаемое окружение.
 EOF
     if [ "$package" = bitrix-env-crm ]; then
-        package_menu='2. Update packages on host'
-        php_menu='6. Update PHP and MySQL'
+        package_menu='2. Update packages on host (обновление пакетов на узле)'
+        php_menu='6. Update PHP and MySQL (обновление PHP и MySQL)'
     fi
     status_line info 'Эти действия выполняет администратор на клоне через штатное меню BitrixEnv.'
     echo '   Войдите на сервер управления пулом как root и запустите bash /root/menu.sh.'
     echo '   Для отдельного сервера это меню запускается на самом клоне.'
     if [ "$route" = environment ]; then
         cat <<EOF
-5. Сначала проверьте маршрут обновления самого BitrixEnv до выпуска 7.5.3–7.5.5. Где это предусмотрено инструкцией для вашего выпуска, используйте 1. Manage servers in the pool → $package_menu → имя нужного хоста → bitrix. Сверьте название пункта в своём меню, уточните состав пакетов и опробуйте задачу на клоне.
+5. Сначала проверьте маршрут обновления самого BitrixEnv до выпуска 7.5.3–7.5.5. Где это предусмотрено инструкцией для вашего выпуска, используйте 1. Manage servers in the pool (управление серверами пула) → $package_menu → имя нужного хоста → bitrix. Сверьте название пункта в своём меню, уточните состав пакетов и опробуйте задачу на клоне.
    Для перехода на 7.5.0 действовала отдельная процедура из-за обновления Ansible. Если ваш маршрут проходит через 7.5.0 или требует обновления Ansible, сверьтесь с примечанием поставщика до запуска задачи пула https://dev.1c-bitrix.ru/community/forums/forum32/topic138822/
-6. Дождитесь завершения задачи в Background pool tasks → View running tasks и проверьте результат по журналу в /opt/webdir/temp. После успешного обновления окружения перезагрузите обновлённый узел клона, дождитесь запуска служб, проверьте сайт и выполните bash install.sh --plan.
+6. Дождитесь завершения задачи в Background pool tasks (фоновые задачи пула) → View running tasks (просмотр выполняемых задач) и проверьте результат по журналу в /opt/webdir/temp. После успешного обновления окружения перезагрузите обновлённый узел клона, дождитесь запуска служб, проверьте сайт и выполните bash install.sh --plan.
    Меню описано в курсе Bitrix https://dev.1c-bitrix.ru/learning/course/?COURSE_ID=37&LESSON_ID=8825
 EOF
     else
         if [[ "$version" == 7.5.3 && "$cli" == 8.1.* ]]; then
-            echo '5. Для BitrixEnv 7.5.3 с PHP 8.1 пункт Upgrade PHP может отсутствовать. В 7.5.4 это исправлено. Проверьте на клоне обновление окружения до 7.5.4–7.5.5, затем повторите bash install.sh --plan.'
+            echo '5. Для BitrixEnv 7.5.3 с PHP 8.1 пункт Upgrade PHP (обновление PHP) может отсутствовать. В 7.5.4 это исправлено. Проверьте на клоне обновление окружения до 7.5.4–7.5.5, затем повторите bash install.sh --plan.'
             menu_step=6
         fi
         case "$cli" in
@@ -726,9 +726,9 @@ EOF
         esac
         if [ -n "$php_target" ]; then
             printf '%s. После проверки зависимостей выберите только следующий этап PHP %s на клоне.\n' "$menu_step" "$php_target"
-            echo "   1. Manage servers in the pool → $php_menu → имя нужного хоста → Upgrade PHP → PHP $php_target. Сверьте названия пунктов в своём меню."
+            echo "   1. Manage servers in the pool (управление серверами пула) → $php_menu → имя нужного хоста → Upgrade PHP (обновление PHP) → PHP $php_target. Сверьте названия пунктов в своём меню."
         else
-            printf '%s. Для исходного PHP подтвердите на клоне совместимую промежуточную ветку. В меню Upgrade PHP выберите эту ветку и проверьте результат перед следующим переходом.\n' "$menu_step"
+            printf '%s. Для исходного PHP подтвердите на клоне совместимую промежуточную ветку. В меню Upgrade PHP (обновление PHP) выберите эту ветку и проверьте результат перед следующим переходом.\n' "$menu_step"
         fi
         if [ "$version" = 7.5.5 ]; then
             case "$cli" in
@@ -739,7 +739,7 @@ EOF
         fi
         printf '%s. ' "$((menu_step + 1))"
         cat <<'EOF'
-После каждого этапа дождитесь завершения задачи в Background pool tasks → View running tasks. Проверьте результат по журналу в /opt/webdir/temp. При ошибке устраните её перед следующим этапом.
+После каждого этапа дождитесь завершения задачи в Background pool tasks (фоновые задачи пула) → View running tasks (просмотр выполняемых задач). Проверьте результат по журналу в /opt/webdir/temp. При ошибке устраните её перед следующим этапом.
 EOF
         printf '%s. ' "$((menu_step + 2))"
         cat <<'EOF'
@@ -922,7 +922,7 @@ make_openssl_patch() {
     { print }
     /^#include <openssl\/dh.h>$/ {
       print ""
-      print "/* OpenSSL 1.0.2 compatibility (EL7) */"
+      print "/* Совместимость с OpenSSL 1.0.2 (EL7) */"
       print "#if PHP_OPENSSL_API_VERSION < 0x10100"
       print "static const unsigned char *ASN1_STRING_get0_data(const ASN1_STRING *asn1)"
       print "{"
@@ -938,8 +938,8 @@ make_openssl_patch() {
     msg 'Патч совместимости OpenSSL подготовлен и проверен.'
 }
 
-# Replacements for the build/source functions in install.sh.
-# Relies on the fixed set_php_target profile map and make_openssl_patch.
+# Замены функций сборки и подготовки исходников в install.sh.
+# Используют фиксированную карту профилей set_php_target и make_openssl_patch.
 make_el7_ffi_patch() {
     local tarball="$1" dest="$2" temp orig edited result
     need tar grep sed diff patch || return
@@ -975,7 +975,7 @@ prepare_spec() {
     [ -f "$spec" ] || { err "Не найден $TARGET_SPEC в $root/SPECS."; return 31; }
     cp -- "$spec" "$spec.original" || return
     if ! grep -q "^Patch$anchor:" "$spec" || ! grep -q "^%patch -P$anchor " "$spec"; then
-        err "Структура spec изменилась: не удалось найти Patch$anchor."; return 31
+        err "Структура спецификации RPM изменилась: не удалось найти Patch$anchor."; return 31
     fi
     # В 8.3 Patch49 находится вне условного блока tzdata: оба исправления обязательны.
     awk -v anchor="$anchor" -v version="$TARGET_PHP" -v branch="$TARGET_BRANCH" '
@@ -995,7 +995,7 @@ prepare_spec() {
     {print}
     ' "$spec" > "$new" || return
     if ! grep -q '^Patch900:' "$new" || ! grep -q '^%patch -P900' "$new" || ! grep -q '>= 73' "$new"; then
-        err 'Не удалось корректно модифицировать spec.'; return 31
+        err 'Не удалось корректно изменить спецификацию RPM.'; return 31
     fi
     if [ "$TARGET_BRANCH" = 8.3 ] && { ! grep -q '^Patch901:' "$new" || ! grep -q '^%patch -P901 ' "$new"; }; then
         err 'Не удалось добавить обязательный патч FFI для glibc EL7.'; return 31
@@ -1025,7 +1025,7 @@ source_prepare() {
     else
         safe_download "$SRC_RPM_URL" "$dir/remi.src.rpm" || return
     fi
-    # Полный доверенный SRPM включает spec, патчи и публичный keyring.
+    # Полный доверенный SRPM включает спецификацию, патчи и хранилище открытых ключей.
     if ! (cd -- "$dir" && printf '%s  remi.src.rpm\n' "$SRC_RPM_SHA256" | sha256sum -c -); then
         err 'SHA-256 SRPM не совпал с закреплённым значением Remi. Распаковка запрещена.'; return 30
     fi
@@ -1050,9 +1050,9 @@ source_prepare() {
     }
     sig="$top/SOURCES/php-$TARGET_PHP.tar.xz.asc"
     keyring="$top/SOURCES/php-keyring.gpg"
-    [ -f "$sig" ] && [ -f "$keyring" ] || { err 'Не найдены подпись PHP и keyring.'; return 30; }
+    [ -f "$sig" ] && [ -f "$keyring" ] || { err 'Не найдены подпись PHP и хранилище открытых ключей.'; return 30; }
     mkdir -m 0700 "$dir/gnupg" || return
-    # EL7 GnuPG может пропустить другие ключи общего PHP keyring.
+    # GnuPG в EL7 может пропустить другие ключи общего хранилища ключей PHP.
     # Проверенная подпись и точные отпечатки ниже остаются обязательными.
     gpg --homedir "$dir/gnupg" --batch --quiet --import "$keyring" > "$dir/source-keyring-import.log" 2>&1 ||
         warn "GPG завершил импорт с замечаниями. См. $dir/source-keyring-import.log"
@@ -1121,10 +1121,10 @@ build_rpms() {
         tail -n 45 "$work/dependencies-check.log"
         need yum-builddep || { err 'Для зависимостей требуется yum-utils и команда yum-builddep.'; return 42; }
         echo 'Команда yum-builddep может обновить systemd, curl и другие критические пакеты на сборочной ВМ.'
-        confirm_phrase 'Разрешить установку build-зависимостей НА КЛОНЕ после предварительного просмотра транзакции?' 'РАЗРЕШАЮ НА КЛОНЕ' || return
+        confirm_phrase 'Разрешить установку зависимостей сборки НА КЛОНЕ после предварительного просмотра транзакции?' 'РАЗРЕШАЮ НА КЛОНЕ' || return
         yum-builddep --assumeno "$top/SPECS/$TARGET_SPEC" 2>&1 | tee "$work/builddeps-preview.log" || true
         confirm_phrase 'Транзакция показана выше. Запустить её НА КЛОНЕ?' 'ВЫПОЛНИТЬ НА КЛОНЕ' || return
-        yum-builddep -y "$top/SPECS/$TARGET_SPEC" || { err 'Установка build-зависимостей завершилась ошибкой.'; mark_state failed_deps; return 42; }
+        yum-builddep -y "$top/SPECS/$TARGET_SPEC" || { err 'Установка зависимостей сборки завершилась ошибкой.'; mark_state failed_deps; return 42; }
     fi
     msg 'Компиляция и создание RPM. Подробности: build.log'
     mark_state building
@@ -1347,7 +1347,7 @@ run_auto_update() (
     fi
     need gpgv sha256sum || return
     AUTO_KEYRING="$(trusted_rpm_keyring "$AUTO_KEYRING")" || {
-        err 'Доверенный keyring недоступен или имеет небезопасные права.'; return 80
+        err 'Доверенное хранилище ключей недоступно или имеет небезопасные права.'; return 80
     }
     ensure_session_dir "$UPDATER_STATE" && ensure_session_dir "$WORK_ROOT" || return
     check_disk "$WORK_ROOT" 1024 || return
@@ -1423,8 +1423,8 @@ auto_update_dispatch() {
         [ -z "$selector" ] || setup_options+=(--site "$selector")
         [ "$unattended" = 0 ] || setup_options+=(--unattended)
         setup_auto_update "${setup_options[@]}" || return
-        # Setup saved the exact vhost record, including an interactive choice.
-        # Reusing a hostname or DocumentRoot selector could ask the same question twice.
+        # Настройка сохранила точную запись виртуального хоста, включая выбор в меню.
+        # Повторный поиск по имени хоста или DocumentRoot мог бы повторить вопрос.
         selector=''
     fi
     run_auto_update "$config" "$unattended" "$selector"
@@ -1534,7 +1534,7 @@ select_rpms() {
             old) [ "$record" = "${expected[$name]}" ] || continue ;;
         esac
         if ! [[ "$arch" = x86_64 && "$release" =~ $el7_release ]]; then
-            err "Неподдерживаемая архитектура или release: $record"; return 50
+            err "Неподдерживаемая архитектура или выпуск пакета: $record"; return 50
         fi
         # На RPM 4.11 исходный пакет может также иметь ARCH=x86_64.
         source_package="$(rpm -qp --nosignature --qf '%{SOURCEPACKAGE}' -- "$path")" || return 50
@@ -1807,7 +1807,7 @@ run_update() {
         return 61
     fi
     if [ -z "$rpmdir" ] || [ -z "$rollback_dir" ] || ! keyring="$(trusted_rpm_keyring "$keyring")"; then
-        err 'Нужны каталоги новых и прежних подписанных RPM. Доверенный keyring укажите абсолютным путём в каталоге root без прав записи для группы и остальных.'
+        err 'Нужны каталоги новых и прежних подписанных RPM. Доверенное хранилище ключей укажите абсолютным путём в каталоге root без прав записи для группы и остальных.'
         mark_state precheck_failed
         return 61
     fi
@@ -1963,7 +1963,7 @@ plan_rpm_rollback() {
     ' "$1" "$2" "$3"
 }
 
-# A receipt on the original session survives interrupted recovery processes.
+# Запись в исходной сессии сохраняется даже при прерывании восстановления.
 record_rollback_rpm_state() {
     local source="$1" state="$2" tmp
     tmp="$(mktemp "$source/.rollback-rpm-state.XXXXXXXX")" || return 1
@@ -1987,8 +1987,9 @@ rollback_rpm_uncertain() {
         esac
     fi
     case "$original_state" in installing|installation_failed) return 0 ;; esac
-    # Older releases did not write a receipt. An earlier incomplete RPM stage
-    # requires one conservative repair even if another old attempt later succeeded.
+    # Старые выпуски не сохраняли такую запись. Незавершённый этап работы с RPM
+    # требует однократного восстановления, даже если другая попытка в старой версии
+    # позднее завершилась успешно.
     for attempt in "$UPDATER_STATE"/sessions/*; do
         private_session_dir "$attempt" || continue
         private_session_file "$attempt/rollback-of" || continue
@@ -2090,7 +2091,8 @@ run_rollback() {
         return 71
     fi
     if [ "$uncertainty_rc" -eq 0 ]; then
-        # Interrupted install/recovery may leave old headers with uncertain files or scriptlets.
+        # Прерванная установка или откат могут оставить старые заголовки RPM,
+        # при этом состояние файлов и результат сценариев пакета остаются неизвестными.
         rollback_rpms=("${SELECTED_RPMS[@]}")
         rollback_flags=(--oldpackage --replacepkgs)
         msg 'Предыдущая RPM-транзакция не подтверждена. Восстанавливаем весь прежний набор RPM.'
@@ -2291,7 +2293,7 @@ BitrixEnv 7, пакетный PHP 8.2.x или 8.3.x. Цели — PHP 8.2.35 / 
 EOF
 }
 
-# Prepare release assets on a trusted build/signing machine.
+# Подготавливаем файлы выпуска на доверенной машине сборки и подписи.
 prepare_release() (
     local new_dir="$1" old_dir="$2" signer="$3" output="$4"
     local parent base work='' lock='' tool verify_tool key_info key_fpr key_algorithm
@@ -2817,7 +2819,7 @@ menu_install_rpms() {
     printf 'Каталог точных старых RPM для отката: '
     IFS= read -r old_path || return 1
     if [ -z "$old_path" ]; then echo 'Установка отменена.'; return 0; fi
-    printf 'Абсолютный путь к доверенному публичному keyring: '
+    printf 'Абсолютный путь к доверенному хранилищу открытых ключей: '
     IFS= read -r keyring || return 1
     if [ -z "$keyring" ]; then echo 'Установка отменена.'; return 0; fi
     printf 'Закрытый URL проверки (Enter — автоматический временный тест): '
@@ -3021,7 +3023,7 @@ setup_auto_update() (
     status_line ok 'Настройки сохранены. Для обновления запустите bash install.sh --auto-update.'
 )
 
-# Список строится из активного дерева Apache, а не из glob всех *.conf.
+# Список строится из активного дерева Apache, а не поиском всех файлов по шаблону *.conf.
 MANAGED_SITE_CANDIDATES=()
 MANAGED_SITE_LABELS=()
 MANAGED_SITE_ALIASES=()
@@ -3291,7 +3293,7 @@ select_managed_site() {
     menu_record site "$MANAGED_SITE"
 }
 
-# Managed probes are scoped to one HTTP check. Never import state from the environment.
+# Временные тесты ограничены одной HTTP-проверкой. Состояние из окружения не принимаем.
 MANAGED_SITE=''
 
 validate_managed_site() {
@@ -3342,8 +3344,9 @@ managed_probe_read_record() {
     printf '%s\n' "$value"
 }
 
-# Caller holds the lease lock. Open directory descriptors anchor cleanup even if
-# a site owner renames the document root or the temporary directory meanwhile.
+# Вызывающая функция удерживает блокировку записи временного теста. Открытые
+# дескрипторы каталогов привязывают очистку к ним, даже если владелец сайта
+# тем временем переименует корневой или временный каталог.
 managed_probe_cleanup_one() (
     local lease="$1" parent_anchor="${2:-}" directory_anchor="${3:-}" MANAGED_SITE=''
     local scheme host port root name parent_id expected_id expected_hash actual file parent_fd='' directory_fd=''
@@ -3370,8 +3373,9 @@ managed_probe_cleanup_one() (
     if [ -n "$directory_anchor" ]; then
         actual="$(stat -Lc '%u:%a:%h' -- "$directory_anchor")" || return 85
         [[ "$actual" =~ ^0:(700|755):(1|2)$ ]] || return 85
-        # A failed mkdir may have collided with another directory. An unclaimed
-        # empty directory is safer to leave than to infer ownership from its name.
+        # mkdir мог завершиться ошибкой из-за существующего чужого каталога.
+        # Пустой каталог без подтверждения принадлежности безопаснее оставить:
+        # одного имени недостаточно для решения об удалении.
         expected_id="$(managed_probe_read_record "$lease/directory.id")" && [[ "$expected_id" =~ ^[0-9]+:[0-9]+$ ]] || return 85
         [ "$(stat -Lc '%d:%i' -- "$directory_anchor")" = "$expected_id" ] || return 85
         file="$directory_anchor/probe.php"
@@ -3387,7 +3391,7 @@ managed_probe_cleanup_one() (
             [ "${actual%% *}" = "$expected_hash" ] || return 85
             rm -f -- "$file" || return 85
         fi
-        # Do not recursively delete directories or follow a replacement symlink.
+        # Не удаляем каталоги рекурсивно и не переходим по подставленной символической ссылке.
         [[ -d "$parent_anchor/$name" && ! -L "$parent_anchor/$name" ]] || return 85
         [ "$(stat -Lc '%d:%i' -- "$parent_anchor/$name")" = "$(stat -Lc '%d:%i' -- "$directory_anchor")" ] || return 85
         rmdir -- "$parent_anchor/$name" || return 85
@@ -3398,7 +3402,7 @@ managed_probe_cleanup_one() (
             rm -f -- "$lease/$name" || return 85
         fi
     done
-    # Interrupted atomic metadata writes are private, regular files only.
+    # Прерванная атомарная запись метаданных оставляет только закрытые обычные файлы.
     for file in "$lease"/.record.*; do
         [ -e "$file" ] || [ -L "$file" ] || continue
         private_session_file "$file" || return 85
@@ -3437,8 +3441,8 @@ managed_http_check() (
     local parent_anchor='' directory_anchor='' token nonce token_hash expiry name url result expected_hash
     local directory_metadata directory_identity parent_real directory_real selinux_status=1
     local -a directory_entries=()
-    # Bash locals inherit export attributes from same-named caller variables.
-    # Keep generated credentials out of child environments as well as argv.
+    # Локальные переменные Bash наследуют признак экспорта одноимённых переменных вызывающего кода.
+    # Секреты не должны попадать ни в окружение дочерних процессов, ни в их аргументы.
     export -n token token_hash
     require_root || return
     validate_managed_site "$MANAGED_SITE" && [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
@@ -3461,7 +3465,7 @@ managed_http_check() (
                 [ "$status" -ne 0 ] || status=85
             fi
         elif [ -n "$stage" ] && private_session_dir "$stage"; then
-            # This is a private staging directory; no web file exists yet.
+            # Это закрытый подготовительный каталог; доступного через веб файла ещё нет.
             rm -rf -- "$stage" || { [ "$status" -ne 0 ] || status=85; }
         fi
         exit "$status"
@@ -3516,10 +3520,11 @@ PHP
     [ ! -e "$state/$nonce" ] && [ ! -L "$state/$nonce" ] || return 85
     mv -T -- "$stage" "$state/$nonce" || return 85
     lease="$state/$nonce"; stage=''
-    # The parent belongs to the site owner, who can replace a directory entry
-    # after mkdir. Never open, populate, or chmod a replacement blindly.
-    # Root0755 is safe from creation: credentials stay in the private lease and
-    # probe.php is O_EXCL-created at0600 until its complete guard is ready.
+    # Родительский каталог принадлежит владельцу сайта, который может подменить
+    # запись после mkdir. Не открываем подмену, не пишем в неё и не меняем права.
+    # Каталог с владельцем root и правами 0755 защищён с момента создания: секреты
+    # остаются в закрытом каталоге записи теста, а probe.php создаётся с O_EXCL и правами 0600
+    # до завершения подготовки всей защиты.
     mkdir -m 0755 -- "$parent_anchor/$name" || return 85
     directory_metadata="$(stat -c '%F:%u:%a:%d:%i' -- "$parent_anchor/$name")" || return 85
     [[ "$directory_metadata" =~ ^directory:0:755:([0-9]+:[0-9]+)$ ]] || {
@@ -3557,7 +3562,7 @@ PHP
     fi
     if [ "$selinux_status" = 0 ]; then
         need chcon || return 85
-        # Anchor both reference and targets; never relabel a replaced web path.
+        # Закрепляем и образец, и цели дескрипторами; не меняем контекст подменённого веб-пути.
         chcon --reference="$parent_anchor/." -- "$directory_anchor/." "$directory_anchor/probe.php" >/dev/null 2>&1 || {
             err 'Не удалось подготовить SELinux-контекст временной проверки.'; return 85;
         }
@@ -3674,20 +3679,20 @@ if [ -z "$py" ]; then
     exit $?
 fi
 
-# Встроенная программа исполняется из stdin: --diagnose не создаёт .py-файлов на диске.
+# Встроенная программа исполняется из стандартного ввода: --diagnose не создаёт .py-файлов на диске.
 audit_targets="$(set_php_target 8.2; printf '8.2=%s;' "$TARGET_PHP"; set_php_target 8.3; printf '8.3=%s' "$TARGET_PHP")"
-# FD 4 сохраняет ввод пользователя: stdin Python занят встроенным кодом.
+# Дескриптор 4 сохраняет ввод пользователя: стандартный ввод Python занят встроенным кодом.
 {
     sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGETS="$audit_targets" BITRIX_MASTER_SCRIPT_DIR="$(dirname -- "$SELF")" "$py" -B - "$@"
 } 4<&0
 exit $?
 
-# Всё после этой строки — встроенный код Python, внутри heredoc для bash -n.
+# Всё после этой строки — встроенный код Python в многострочном блоке ввода для bash -n.
 : <<'__PYTHON_PAYLOAD_END__'
 __PYTHON_PAYLOAD_START__
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Bitrix Server Master — read-only diagnostics engine (stdlib only)."""
+"""Bitrix Server Master — диагностика без изменения системы, только стандартная библиотека Python."""
 import argparse
 import datetime as dt
 import glob
@@ -3800,7 +3805,7 @@ def package_list():
         parts = line.split('|')
         if len(parts) == 3:
             packages.append({'name': parts[0], 'version': parts[1], 'release': parts[2]})
-    # Avoid unbounded output: for safety the collector intentionally stores only relevant packages.
+    # Ограничиваем объём вывода: сборщик сохраняет только относящиеся к диагностике пакеты.
     return packages, None
 
 
@@ -3942,7 +3947,7 @@ PHP_METADATA_TOKENS = re.compile(
 
 @contextmanager
 def audit_parent(path):
-    # Hold each directory open so a concurrently replaced symlink cannot redirect a privileged read.
+    # Держим каждый каталог открытым, чтобы подмена ссылки не перенаправила чтение с привилегиями.
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parts = path.parts
     fd = os.open(parts[0], flags)
@@ -4071,7 +4076,7 @@ def bitrix_environment(packages, pkg_err):
             result.update(version=ver, status='confirmed')
         return result
 
-    # Historical marker files can identify a version with lower confidence than RPM.
+    # Старые файлы-маркеры позволяют определить версию, но менее достоверно, чем RPM.
     evidence = []
     for path in BITRIX_VERSION_FILES:
         data, status = audit_file(path, 4096)
@@ -4091,8 +4096,8 @@ def bitrix_core(site, allowed_cores):
         with audit_parent(core) as (parent, name):
             mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
             if stat.S_ISLNK(mode):
-                # A standard link may share a known site's bitrix directory. Reopen that exact
-                # path without following any links, including chains or a changed target.
+                # Стандартная ссылка может вести в каталог bitrix уже известного сайта.
+                # Открываем именно этот путь без перехода по ссылкам, их цепочкам или подменённой цели.
                 target = os.path.normpath(str(site / os.readlink(name, dir_fd=parent)))
                 if target not in allowed_cores:
                     return core, {'version': None, 'status': 'unavailable', 'source': None}
@@ -4269,7 +4274,7 @@ def url_probe(url):
         return invalid
     try:
         req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'BitrixServerMaster/' + VERSION})
-        # Redirects may be followed by urllib. This probe is opt-in only.
+        # urllib может следовать перенаправлениям. Проверка включается только явно.
         with urllib.request.urlopen(req, timeout=7) as resp:
             return {'url': url, 'status': 'ok', 'http_code': resp.status, 'note': 'HEAD; версия веб-PHP не подтверждается'}
     except urllib.error.HTTPError as e:
@@ -4327,7 +4332,7 @@ def report_for(args):
               'Проверка способа подключения PHP неполная.')
     if servers['apache']['mod_php'] is True and servers['apache']['active'] == 'active':
         alert('info', 'MOD_PHP', 'Обнаружен mod_php',
-              'После обновления модулей PHP нужен согласованный полный перезапуск Apache; одного reload может быть недостаточно.')
+              'После обновления модулей PHP нужен согласованный полный перезапуск Apache; одного перечитывания конфигурации (reload) может быть недостаточно.')
     if servers['apache']['mod_php'] is None and servers['php_fpm']['active'] != 'active':
         alert('info', 'WEB_PHP_UNCONFIRMED', 'Версия PHP через веб-сервер не установлена',
               'Диагностика не создаёт phpinfo.php и не выполняет PHP-код на сайте.')
@@ -4606,7 +4611,7 @@ def safe_write_report(rep, path):
         stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
         path = f'./bitrix-audit-{name}-{stamp}.json'
     path = os.path.abspath(os.path.expanduser(path))
-    # Refuse overwrite and symlink targets; use restrictive file mode from creation onward.
+    # Не перезаписываем файлы и цели символических ссылок; закрытые права задаём при создании.
     old = os.umask(0o077)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -4625,7 +4630,7 @@ def reported_bitrix_version(report):
     ver, packages = bitrix.get('version'), bitrix.get('packages')
     if 'environment' in bitrix or not isinstance(packages, list):
         return ver
-    # Older reports saved RPM VERSION alone. Reuse their recorded RELEASE for comparison.
+    # Старые отчёты сохраняли только VERSION пакета RPM. Для сравнения используем также записанный RELEASE.
     rows = [p for p in packages if isinstance(p, dict) and p.get('name') in BITRIX_ENV_RPM_NAMES]
     if len(rows) == 1 and rows[0].get('version') == ver:
         return bitrix_rpm_version(rows[0]) or ver
@@ -4633,7 +4638,7 @@ def reported_bitrix_version(report):
 
 
 def report_text(value):
-    """Report contents and filenames are data, never terminal escape sequences."""
+    """Содержимое отчётов и имена файлов — данные, а не управляющие последовательности терминала."""
     text = 'неизвестно' if value is None else str(value)
     return ''.join(c if c.isprintable() else repr(c)[1:-1] for c in text)[:500]
 
@@ -4661,7 +4666,7 @@ def report_date(report):
 
 
 def load_report(path):
-    # O_NONBLOCK and fstat also cover a regular file replaced by a FIFO during discovery.
+    # O_NONBLOCK и fstat также защищают от подмены обычного файла каналом FIFO во время поиска.
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as fh:
         meta = os.fstat(fh.fileno())
@@ -4825,7 +4830,7 @@ def choose_report(terminal, reports, title):
 
 def latest_report_pair(reports):
     pairs = {}
-    for item in reports:  # Discovery is sorted newest first.
+    for item in reports:  # Результаты поиска отсортированы от новых к старым.
         host = item[1]['hostname']
         group = pairs.setdefault(host, [])
         if not group or (len(group) == 1 and report_date(item[1]) < report_date(group[0][1])):
@@ -4902,7 +4907,7 @@ def compare_menu(terminal):
                 continue
             pair = (before, after)
         try:
-            # Re-read the chosen files: removal or replacement is a recoverable error.
+            # Читаем выбранные файлы заново: при удалении или подмене можно вернуться к выбору.
             return compare_reports([item[0] for item in pair], False)
         except (OSError, ValueError, RecursionError) as e:
             report_status('critical', 'Не удалось сравнить отчёты: ' + str(e))
@@ -4914,7 +4919,7 @@ def parse_args(argv):
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--quick', action='store_true', help='краткая диагностика')
     group.add_argument('--full', action='store_true', help='расширенная диагностика')
-    parser.add_argument('--json', action='store_true', help='вывести JSON в stdout')
+    parser.add_argument('--json', action='store_true', help='вывести JSON в стандартный поток вывода')
     parser.add_argument('--report', nargs='?', const='AUTO', metavar='ФАЙЛ', help='сохранить JSON-отчёт (создаёт только указанный файл)')
     parser.add_argument('--check-updates', action='store_true', help='сверить патч-версию PHP с php.net по HTTPS')
     parser.add_argument('--offline', action='store_true', help='не обращаться к сети')

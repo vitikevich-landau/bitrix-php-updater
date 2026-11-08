@@ -2,9 +2,9 @@
 set -o pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/fixture-common.sh" "$@"
 for fixture in /root/rc9-race-state /root/rc9-race-victim /root/rc9-race-target /root/rc9-race-http-started /root/rc9-race-log /var/www/rc9-race-site; do
-    if [ -e "$fixture" ] || [ -L "$fixture" ]; then echo "Refusing to overwrite an existing fixture path: $fixture" >&2; exit 2; fi
+    if [ -e "$fixture" ] || [ -L "$fixture" ]; then echo "Отказ от перезаписи существующего пути тестовых данных: $fixture" >&2; exit 2; fi
 done
-command -v runuser >/dev/null && [ "$(id -u nobody)" = 99 ] || { echo 'The fixture requires the CentOS nobody account (UID99) and runuser.' >&2; exit 2; }
+command -v runuser >/dev/null && [ "$(id -u nobody)" = 99 ] || { echo 'Для тестового стенда нужны учётная запись nobody из CentOS (UID 99) и runuser.' >&2; exit 2; }
 failures=0
 for race_mode in attacker_directory root_symlink root_private_directory root_nonempty_directory; do
     UPDATER_STATE=/root/rc9-race-state
@@ -45,7 +45,7 @@ for race_mode in attacker_directory root_symlink root_private_directory root_non
     }
     curl() { touch /root/rc9-race-http-started; return 28; }
     if managed_http_check 8.2.20 > /root/rc9-race-log 2>&1; then
-        printf 'FAIL %s unexpectedly succeeded\n' "$race_mode"; failures=$((failures + 1))
+        printf 'FAIL %s: неожиданно получен успешный результат\n' "$race_mode"; failures=$((failures + 1))
     fi
     unset -f mkdir curl
     target="$(cat /root/rc9-race-target)"
@@ -59,9 +59,9 @@ for race_mode in attacker_directory root_symlink root_private_directory root_non
         root_nonempty_directory)
             [ "$(cat "$target/secret")" = 'private directory data' ] && [ ! -e "$target/probe.php" ] || ok=0 ;;
     esac
-    if [ "$ok" -eq 1 ]; then printf 'PASS %s prewrite refusal preserves unrelated data and permissions\n' "$race_mode";
-    else printf 'FAIL %s changed unrelated data/permissions or reached HTTP\n' "$race_mode"; failures=$((failures + 1)); fi
-    # Fixed disposable fixture roots, never production website paths.
+    if [ "$ok" -eq 1 ]; then printf 'PASS %s: отказ до записи сохраняет посторонние данные и права\n' "$race_mode";
+    else printf 'FAIL %s: изменены посторонние данные или права либо выполнен HTTP-запрос\n' "$race_mode"; failures=$((failures + 1)); fi
+    # Фиксированные корни одноразовых тестовых данных; пути рабочих сайтов не используются.
     rm -rf -- /var/www/rc9-race-site /root/rc9-race-state /root/rc9-race-victim
     rm -f -- /root/rc9-race-target /root/rc9-race-http-started /root/rc9-race-log
 done
