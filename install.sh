@@ -90,15 +90,15 @@ python_path() {
 bootstrap_python() {
     local archive="$1" base parent target tmp url result available_kb
     if [ ! -t 0 ]; then
-        echo 'ОШИБКА: установка Python требует интерактивного подтверждения в SSH.' >&2
+        err 'установка Python требует интерактивного подтверждения в SSH.'
         return 5
     fi
     if [ "$(uname -s)" != 'Linux' ] || [ "$(uname -m)" != 'x86_64' ]; then
-        echo 'ОШИБКА: изолированный Python поддержан пока только для Linux x86_64.' >&2
+        err 'изолированный Python поддержан пока только для Linux x86_64.'
         return 5
     fi
     if ! command -v sha256sum >/dev/null || ! command -v tar >/dev/null || ! command -v mktemp >/dev/null; then
-        echo 'ОШИБКА: необходимы sha256sum, tar и mktemp.' >&2
+        err 'необходимы sha256sum, tar и mktemp.'
         return 5
     fi
     if [ "$(id -u)" = '0' ]; then
@@ -108,11 +108,11 @@ bootstrap_python() {
     fi
     target="$base/runtime-${PY_RELEASE}"
     if python_is_ok "$target/bin/python3"; then
-        echo "Изолированный Python уже установлен: $target/bin/python3"
+        status_line ok "Изолированный Python уже установлен: $target/bin/python3"
         return 0
     fi
     if [ -e "$target" ] || [ -L "$target" ]; then
-        echo "ОШИБКА: каталог уже существует, но Python не работает: $target" >&2
+        err "каталог уже существует, но Python не работает: $target"
         echo 'Автоматически чужие файлы не перезаписываем.' >&2
         return 5
     fi
@@ -124,53 +124,53 @@ bootstrap_python() {
     echo 'Системный /usr/bin/python, yum, PHP, Apache и конфигурации не изменяются.'
     echo 'Будет создан отдельный каталог и временные файлы для проверки архива.'
     if ! confirm_action 'Подтвердить установку?'; then
-        echo 'Отменено. Изменений нет.'
+        status_line warning 'Отменено. Изменений нет.'
         return 4
     fi
     parent="$(dirname "$base")"
     if ! mkdir -p -- "$base"; then
-        echo "ОШИБКА: не удалось создать $base" >&2
+        err "не удалось создать $base"
         return 5
     fi
     available_kb="$(df -Pk "$base" 2>/dev/null | awk 'NR==2 {print $4}')"
     if [ -n "$available_kb" ] && [ "$available_kb" -lt 300000 ] 2>/dev/null; then
-        echo 'ОШИБКА: для безопасной подготовки Python нужно минимум 300 МиБ свободно.' >&2
+        err 'для безопасной подготовки Python нужно минимум 300 МиБ свободно.'
         return 5
     fi
     tmp="$(mktemp -d "$base/.python-stage.XXXXXXXX")" || return 5
     if [ -n "$archive" ]; then
         if [ ! -f "$archive" ] || [ -L "$archive" ]; then
-            echo 'ОШИБКА: локальный архив не найден или является символической ссылкой.' >&2
+            err 'локальный архив не найден или является символической ссылкой.'
             rm -rf -- "$tmp"
             return 5
         fi
         if ! cp -- "$archive" "$tmp/archive.tar.gz"; then
-            echo 'ОШИБКА: не удалось скопировать локальный архив.' >&2
+            err 'не удалось скопировать локальный архив.'
             rm -rf -- "$tmp"
             return 5
         fi
     else
         if ! command -v curl >/dev/null 2>&1; then
-            echo 'ОШИБКА: curl отсутствует. Используйте --python-archive.' >&2
+            err 'curl отсутствует. Используйте --python-archive.'
             rm -rf -- "$tmp"
             return 5
         fi
         echo 'Скачивание Python по HTTPS (без -k / --insecure)...'
         if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
                   --connect-timeout 12 --max-time 240 --output "$tmp/archive.tar.gz" "$PY_URL"; then
-            echo 'ОШИБКА: скачивание не удалось. Системные пакеты не тронуты.' >&2
+            err 'скачивание не удалось. Системные пакеты не тронуты.'
             rm -rf -- "$tmp"
             return 5
         fi
     fi
     if ! printf '%s  %s\n' "$PY_SHA256" "$tmp/archive.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
-        echo 'ОШИБКА: SHA-256 архива не совпал с закреплённым значением. Распаковка запрещена.' >&2
+        err 'SHA-256 архива не совпал с закреплённым значением. Распаковка запрещена.'
         rm -rf -- "$tmp"
         return 5
     fi
-    echo 'Контрольная сумма совпала. Проверяю содержимое архива...'
+    status_line ok 'Контрольная сумма совпала. Проверяю содержимое архива...'
     if ! tar -tzf "$tmp/archive.tar.gz" >"$tmp/entries" 2>/dev/null; then
-        echo 'ОШИБКА: неверный формат архива.' >&2
+        err 'неверный формат архива.'
         rm -rf -- "$tmp"
         return 5
     fi
@@ -178,32 +178,32 @@ bootstrap_python() {
     if awk '/^\// || /(^|\/)\.\.($|\/)/ || !/^python\// {bad=1} END{exit bad}' "$tmp/entries"; then
         :
     else
-        echo 'ОШИБКА: архив содержит небезопасные пути.' >&2
+        err 'архив содержит небезопасные пути.'
         rm -rf -- "$tmp"
         return 5
     fi
     if ! tar --no-same-owner --no-same-permissions -xzf "$tmp/archive.tar.gz" -C "$tmp"; then
-        echo 'ОШИБКА: не удалось распаковать архив.' >&2
+        err 'не удалось распаковать архив.'
         rm -rf -- "$tmp"
         return 5
     fi
     if ! python_is_ok "$tmp/python/bin/python3"; then
-        echo 'ОШИБКА: проверка нового Python не прошла (возможно несовместимая ОС).' >&2
+        err 'проверка нового Python не прошла (возможно несовместимая ОС).'
         rm -rf -- "$tmp"
         return 5
     fi
     if [ -e "$target" ] || [ -L "$target" ]; then
-        echo 'ОШИБКА: целевой каталог появился во время операции.' >&2
+        err 'целевой каталог появился во время операции.'
         rm -rf -- "$tmp"
         return 5
     fi
     if ! mv -- "$tmp/python" "$target"; then
-        echo 'ОШИБКА: не удалось завершить развёртывание.' >&2
+        err 'не удалось завершить развёртывание.'
         rm -rf -- "$tmp"
         return 5
     fi
     rm -rf -- "$tmp"
-    echo "Готово: $target/bin/python3"
+    status_line ok "Готово: $target/bin/python3"
     echo 'Системный Python и пакеты ОС не изменялись.'
     return 0
 }
@@ -350,8 +350,15 @@ WORK_ROOT='/var/lib/bitrix-server-master/work'
 CORE_RPM_NAMES='php php-cli php-common php-gd php-ldap php-mbstring php-mysqlnd php-opcache php-pdo php-process php-pspell php-sodium php-xml php-bcmath php-dba php-devel php-embedded php-enchant php-ffi php-fpm php-gmp php-imap php-intl php-litespeed php-odbc php-pdo-dblib php-pdo-firebird php-pgsql php-snmp php-soap php-tidy php-dbg php-debuginfo'
 
 msg() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
-err() { printf '\nОШИБКА: %s\n' "$*" >&2; }
-warn() { printf '\nВНИМАНИЕ: %s\n' "$*" >&2; }
+console_line() {
+    if [[ -t 1 && "${TERM:-}" != dumb && -z "${NO_COLOR:-}" ]]; then
+        printf '\033[%sm%s\033[0m\n' "$1" "$2"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+err() { { printf '\n'; console_line 31 "ОШИБКА: $*"; } >&2; }
+warn() { { printf '\n'; console_line 33 "ВНИМАНИЕ: $*"; } >&2; }
 status_line() {
     local label color
     case "$1" in
@@ -360,11 +367,7 @@ status_line() {
         critical) label='КРИТИЧНО'; color=31 ;;
         info)     label='ИНФО';     color=36 ;;
     esac
-    if [[ -t 1 && "${TERM:-}" != dumb && -z "${NO_COLOR:-}" ]]; then
-        printf '\033[%sm[%s] %s\033[0m\n' "$color" "$label" "$2"
-    else
-        printf '[%s] %s\n' "$label" "$2"
-    fi
+    console_line "$color" "[$label] $2"
 }
 
 require_root() { if [ "$(id -u)" -ne 0 ]; then err 'Для этой операции нужны права root.'; return 10; fi; }
@@ -375,7 +378,7 @@ confirm_phrase() {
     echo
     printf '%s\n' "$label"
     if ! confirm_action 'Продолжить?' "$phrase"; then
-        msg 'Операция отменена, подтверждение не получено.'
+        status_line warning 'Операция отменена, подтверждение не получено.'
         return 12
     fi
 }
@@ -455,7 +458,7 @@ profile_check() {
         err 'Обнаружены параллельные SCL-пакеты PHP; ручная проверка обязательна.'; return 20
     fi
     PHP_CURRENT="$cur"
-    printf 'Поддерживаемый профиль: CentOS 7 x86_64, BitrixEnv, Apache prefork/mod_php, PHP %s\n' "$cur"
+    status_line ok "Поддерживаемый профиль: CentOS 7 x86_64, BitrixEnv, Apache prefork/mod_php, PHP $cur"
     return 0
 }
 
@@ -783,7 +786,7 @@ quick_check() {
             next_action='--plan'
             ;;
         unsupported) status_line warning "PHP CLI $cli. Обновление этой ветки не поддерживается; доступны только 8.2.x и 8.3.x." ;;
-        newer) status_line info "PHP CLI $cli. Понижение до $TARGET_PHP не предусмотрено." ;;
+        newer) status_line ok "PHP CLI $cli. Понижение до $TARGET_PHP не предусмотрено." ;;
         target) target_php_status || next_action='--audit --offline' ;;
         patch)
             if ! detail="$(profile_check 2>&1)"; then
@@ -810,7 +813,7 @@ quick_check() {
     esac
 
     if [ -z "$url" ]; then
-        status_line info 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
+        status_line warning 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
     elif [ -z "$cli" ]; then
         status_line warning 'Сайт: веб-PHP не проверен. Не определена ожидаемая версия PHP.'
         web_rc=63
@@ -818,7 +821,7 @@ quick_check() {
         status_line ok "Сайт: веб-PHP $cli (apache2handler) подтверждён, HTTP 200."
     else
         web_rc=$?
-        status_line warning "Сайт: веб-PHP не подтверждён для версии $cli."
+        status_line critical "Сайт: веб-PHP не подтверждён для версии $cli."
         if [ "$route" != older ]; then next_action='--audit --offline'; fi
     fi
 
@@ -836,11 +839,11 @@ show_plan() {
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
     select_php_target_for_version "$cli" || true
     route="$(php_version_route "$cli")"
-    status_line info 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
+    status_line warning 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
     if [[ "$cli" =~ ^8\.[23]\.[0-9]+$ ]]; then
         if detail="$(profile_check 2>&1)"; then
             profile_rc=0
-            printf '%s\n' "$detail"
+            console_line 32 "$detail"
         else
             profile_rc=$?
             detail="${detail##*$'\n'}"
@@ -857,7 +860,7 @@ show_plan() {
             show_os_status
             return "$profile_rc" ;;
         newer)
-            status_line info "Понижение PHP $cli до $TARGET_PHP не предусмотрено."
+            status_line ok "Понижение PHP $cli до $TARGET_PHP не предусмотрено."
             show_os_status
             return "$profile_rc" ;;
     esac
@@ -1388,7 +1391,7 @@ run_auto_update() (
     done < "$work/new/SHA256SUMS"
     select_rpms "$work/old" old "$work/inventory" &&
     select_rpms "$work/new" new "$work/inventory" || return 81
-    msg 'Комплекты проверены. Переходим к проверкам и установке PHP.'
+    status_line ok 'Комплекты проверены. Переходим к проверкам и установке PHP.'
     run_update "$work/new" "$AUTO_HEALTH_URL" "$work/old" "$work/public.gpg" "$unattended" "$work/inventory"
 )
 
@@ -1647,7 +1650,7 @@ http_check() (
         err "Веб-тест должен вернуть HTTP 200 и единственную строку «$marker» с локального порта $port."
         return 63
     fi
-    printf 'Веб-PHP %s (apache2handler) подтверждён на %s, HTTP 200.\n' "$expected" "$url"
+    status_line ok "Веб-PHP $expected (apache2handler) подтверждён на $url, HTTP 200."
 )
 
 verify_after() {
@@ -1794,7 +1797,7 @@ run_update() {
             return 61
         fi
         mark_state already_current || return
-        msg "PHP $TARGET_PHP уже установлен, CLI и сайт прошли проверку."
+        status_line ok "PHP $TARGET_PHP уже установлен, CLI и сайт прошли проверку."
         return 0
     fi
     current="$PHP_CURRENT"
@@ -1916,7 +1919,7 @@ run_update() {
         return 64
     fi
     mark_state completed || return
-    msg "PHP $TARGET_PHP установлен. Apache и сайт прошли проверки."
+    status_line ok "PHP $TARGET_PHP установлен. Apache и сайт прошли проверки."
     printf 'Сессия обновления: %s\nАрхив конфигураций: %s/configuration.tar.gz\n' "$SESSION_NAME" "$dir"
     echo 'Проверьте админку Битрикса и ключевые функции сайта вручную.'
 }
@@ -2169,7 +2172,7 @@ run_rollback() {
         return 72
     fi
     mark_state rollback_completed || return
-    msg "Набор RPM из сессии $id восстановлен. PHP $old_php, Apache и сайт прошли проверки."
+    status_line ok "Набор RPM из сессии $id восстановлен. PHP $old_php, Apache и сайт прошли проверки."
 }
 
 # Без привилегий показывает последнюю сессию и её состояние.
@@ -2186,6 +2189,7 @@ show_status() {
     if [ -z "$last" ]; then echo 'Сессии не найдены.'; return 0; fi
     echo "Последняя сессия: $last"
     echo -n 'Состояние: '; cat "$last/state" 2>/dev/null || echo 'неизвестно'
+    menu_state_text "$(cat "$last/state" 2>/dev/null)"
     if [ -r "$last/rollback-of" ]; then
         printf 'Исходная сессия обновления: '
         cat -- "$last/rollback-of"
@@ -2553,7 +2557,7 @@ menu_update_readiness() {
         NEXT_STATUS=blocked
         NEXT_REASON="Пакеты PHP не согласованы или не подтверждены: ${detail##*$'\n'}"
     elif [ "$route" = target ]; then
-        NEXT_STATUS=current; NEXT_REASON='Цель этого выпуска уже установлена.'
+        NEXT_STATUS=current; NEXT_REASON="Цель этого выпуска уже установлена. Обновление PHP до $NEXT_TARGET не требуется."
     elif [ "$(id -u)" != 0 ]; then
         NEXT_STATUS=needs_root; NEXT_REASON='Для подготовки обновления нужны права root.'
     else
@@ -2596,16 +2600,19 @@ menu_can_rollback() {
 
 menu_state_text() {
     case "$1" in
-        started) echo 'Подготовка операции' ;;
-        precheck_failed|install_test_failed|backup_failed) echo 'Подготовка остановлена до установки PHP' ;;
-        installing|installation_failed) echo 'Установка была начата; требуется проверка состояния пакетов' ;;
-        installed|apache_config_failed|restart_failed|verifying|verify_failed) echo 'Пакеты изменены; проверка результата не завершена успешно' ;;
-        completed) echo 'Обновление завершено, автоматические проверки пройдены' ;;
-        already_current) echo 'Обновление не требуется, установленный PHP проверен' ;;
-        rollback_completed) echo 'Откат завершён, автоматические проверки пройдены' ;;
-        rollback_precheck_failed|rollback_test_failed) echo 'Подготовка отката остановлена' ;;
-        rolling_back|rollback_failed|rollback_verify_failed|rollback_apache_config_failed|rollback_restart_failed) echo 'Восстановление не завершено; проверьте журнал' ;;
-        *) echo 'Состояние не подтверждено; проверьте сведения об операции' ;;
+        started) status_line warning 'Подготовка операции' ;;
+        precheck_failed|install_test_failed|backup_failed) status_line critical 'Подготовка остановлена до установки PHP' ;;
+        installing) status_line warning 'Установка была начата; требуется проверка состояния пакетов' ;;
+        installation_failed) status_line critical 'Установка завершилась ошибкой; требуется проверка состояния пакетов' ;;
+        installed|verifying) status_line warning 'Пакеты изменены; проверка результата ещё не завершена' ;;
+        apache_config_failed|restart_failed|verify_failed) status_line critical 'Пакеты изменены; проверка результата не завершена успешно' ;;
+        completed) status_line ok 'Обновление завершено, автоматические проверки пройдены' ;;
+        already_current) status_line ok 'Обновление не требуется, установленный PHP проверен' ;;
+        rollback_completed) status_line ok 'Откат завершён, автоматические проверки пройдены' ;;
+        rollback_precheck_failed|rollback_test_failed) status_line critical 'Подготовка отката остановлена' ;;
+        rolling_back) status_line warning 'Восстановление ещё не завершено; проверьте журнал' ;;
+        rollback_failed|rollback_verify_failed|rollback_apache_config_failed|rollback_restart_failed) status_line critical 'Восстановление не завершено; проверьте журнал' ;;
+        *) status_line warning 'Состояние не подтверждено; проверьте сведения об операции' ;;
     esac
 }
 
@@ -2637,21 +2644,22 @@ menu_next_actions() {
     printf '\n'
     status_line info 'Что дальше'
     case "$action:$rc" in
-        --check-site:12) echo 'Проверка сайта отменена; веб-PHP этой проверкой не подтверждён.' ;;
-        --setup-update:12) echo 'Настройка отменена; новые настройки не сохранены.' ;;
-        --check-site:0|--setup-update:0) ;;
-        --check-site:*) echo 'Проверка сайта не завершена. Причина указана выше.' ;;
-        --setup-update:*) echo 'Настройка не завершена. Устраните указанную выше причину и повторите её.' ;;
+        --check-site:12) status_line warning 'Проверка сайта отменена; веб-PHP этой проверкой не подтверждён.' ;;
+        --setup-update:12) status_line warning 'Настройка отменена; новые настройки не сохранены.' ;;
+        --check-site:0) status_line ok 'Проверка PHP сайта пройдена.' ;;
+        --setup-update:0) status_line ok 'Настройки автоматического обновления сохранены.' ;;
+        --check-site:*) status_line critical 'Проверка сайта не завершена. Причина указана выше.' ;;
+        --setup-update:*) status_line critical 'Настройка не завершена. Устраните указанную выше причину и повторите её.' ;;
     esac
     case "$action" in
         --auto-update|--update|--rollback|--status)
             operation=1
             if [ "$rc" = 12 ]; then
-                echo 'Операция отменена. Для запуска потребуется новый явный выбор.'
+                status_line warning 'Операция отменена. Для запуска потребуется новый явный выбор.'
             elif [ -n "$MENU_STATE" ]; then
                 menu_state_text "$MENU_STATE"
             elif [ "$rc" != 0 ]; then
-                echo 'Операция остановлена. Причина указана выше; сначала устраните её.'
+                status_line critical 'Операция остановлена. Причина указана выше; сначала устраните её.'
             else
                 echo 'Сведения об операции показаны выше.'
             fi
@@ -2659,7 +2667,7 @@ menu_next_actions() {
             [ -z "$MENU_ORIGIN" ] || printf 'Исходное обновление: %s\n' "$MENU_ORIGIN"
             case "$MENU_STATE" in
                 completed|already_current|rollback_completed)
-                    echo 'Проверьте вручную сайт, админку Битрикса, формы и основные функции.' ;;
+                    status_line warning 'Проверьте вручную сайт, админку Битрикса, формы и основные функции.' ;;
             esac
             if [ -n "$MENU_SESSION" ]; then menu_option details 'Показать сведения и журнал этой операции'; fi
             if [ "$MENU_STATE" != rollback_completed ] && menu_can_rollback "$recovery"; then
@@ -2680,7 +2688,11 @@ menu_next_actions() {
         menu_update_readiness
         [ -z "$NEXT_VERSION" ] || printf 'Текущий PHP: %s\n' "$NEXT_VERSION"
         [ -z "$NEXT_TARGET" ] || printf 'Цель этого выпуска: %s\n' "$NEXT_TARGET"
-        printf '%s\n' "$NEXT_REASON"
+        case "$NEXT_STATUS" in
+            current|newer) status_line ok "$NEXT_REASON" ;;
+            blocked) status_line critical "$NEXT_REASON" ;;
+            *) status_line warning "$NEXT_REASON" ;;
+        esac
         if [ "$NEXT_STATUS" = ready ] && [ "${MENU_WEB_BLOCKED:-0}" != 1 ]; then
             echo 'Проверки сайта, пакетов и возможности отката выполняются при подготовке.'
             echo 'Заранее подготовьте проверенную резервную копию или снимок ВМ.'
@@ -2691,10 +2703,10 @@ menu_next_actions() {
                 menu_option auto 'Подготовить автоматическое обновление PHP'
             fi
         elif [ "$NEXT_STATUS" = needs_root ]; then
-            echo 'Запустите мастер от root и повторите проверку; дополнительные права из меню не выдаются.'
+            status_line warning 'Запустите мастер от root и повторите проверку; дополнительные права из меню не выдаются.'
         fi
         if [ "${MENU_WEB_BLOCKED:-0}" = 1 ]; then
-            echo 'PHP сайта ещё не подтверждён. Сначала устраните причину и повторите проверку сайта.'
+            status_line critical 'PHP сайта ещё не подтверждён. Сначала устраните причину и повторите проверку сайта.'
         fi
         if [ "$NEXT_STATUS" = legacy ]; then
             menu_option plan 'Посмотреть план перехода через BitrixEnv'
@@ -2974,7 +2986,7 @@ setup_auto_update() (
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || return 61
     http_check auto "$cli" || { menu_record web failed; err 'Автоматическая проверка сайта не пройдена. Настройки не сохранены.'; return 61; }
     menu_record web ok
-    printf 'Проверка сайта пройдена для PHP %s.\n' "$cli"
+    status_line ok "Проверка сайта пройдена для PHP $cli."
     if [ -e "$keydir" ] || [ -L "$keydir" ]; then
         private_session_dir "$keydir" || { err 'Каталог /etc/bitrix-php-update должен принадлежать root с правами 0700.'; return 61; }
     else
@@ -3000,7 +3012,7 @@ setup_auto_update() (
     printf 'SOURCE=%s\nKEYRING=%s\nHEALTH_URL=auto\nSITE=%s\n' "$source" "$keyfile" "$MANAGED_SITE" > "$config_temp" || return
     chmod 0600 -- "$config_temp" || return
     mv -f -- "$config_temp" "$config" || return
-    msg 'Настройки сохранены. Для обновления запустите bash install.sh --auto-update.'
+    status_line ok 'Настройки сохранены. Для обновления запустите bash install.sh --auto-update.'
 )
 
 # Список строится из активного дерева Apache, а не из glob всех *.conf.
@@ -3563,7 +3575,7 @@ PHP
             }
         fi
     done
-    printf 'Веб-PHP %s (apache2handler) подтверждён для %s. Временная проверка закрыта и будет удалена.\n' "$expected" "$host"
+    status_line ok "Веб-PHP $expected (apache2handler) подтверждён для $host. Временная проверка закрыта и будет удалена."
 )
 
 # Мутирующие операции: отдельный обработчик Bash, без зависимости от Python.
@@ -4463,7 +4475,7 @@ def print_human(rep):
     elif core_rpms['status'] == 'confirmed':
         status('ok', 'RPM php, php-cli и php-common совпадают с PHP CLI ' + cli_version + '.')
     else:
-        status('info', 'Базовые RPM PHP не подтверждены — ' + core_rpms['reason'] + '.')
+        status('warning', 'Базовые RPM PHP не подтверждены — ' + core_rpms['reason'] + '.')
 
     update = rep['update_check']
     published = None
@@ -4479,11 +4491,11 @@ def print_human(rep):
     elif update['status'] == 'skipped':
         status('info', 'PHP.net — проверка пропущена (--offline)')
     elif update['status'] == 'unavailable':
-        status('info', 'PHP.net — проверка недоступна. ' + update['reason'])
+        status('warning', 'PHP.net — проверка недоступна. ' + update['reason'])
     else:
         status('info', 'PHP.net — проверка не запрошена')
 
-    status('info', 'PHP сайта не подтверждён. Аудит показывает версию PHP CLI.')
+    status('warning', 'PHP сайта не подтверждён. Аудит показывает версию PHP CLI.')
     system = rep['system']
     os_life = system['os_lifecycle']
     if os_life['status'] == 'ended':
@@ -4491,7 +4503,7 @@ def print_human(rep):
     elif os_life['status'] == 'supported':
         status('ok', f"ОС {system['name']} — срок поддержки по справочнику до {os_life['deadline']}")
     else:
-        status('info', f"ОС {system['name']} — срок поддержки не определён")
+        status('warning', f"ОС {system['name']} — срок поддержки не определён")
 
     if core_rpms['status'] in ('mismatch', 'incomplete', 'ambiguous'):
         action = rep['conclusion']['next_step']
@@ -4564,7 +4576,7 @@ def print_human(rep):
     print(' Диск /:         ' + ', '.join(fmt_bytes_gb(x['available_gb'])+' доступно' for x in rep['resources']['disks'] if x['path'] == '/'))
     print('\n РЕЗУЛЬТАТЫ ПРОВЕРОК:')
     if not rep['alerts']:
-        print('   Нет предупреждений в рамках выполненных проверок.')
+        status('ok', 'Нет предупреждений в рамках выполненных проверок.', '   ')
     for a in rep['alerts']:
         status(a['level'], a['title'], '   ')
         print('     ' + a['detail'])

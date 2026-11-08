@@ -122,10 +122,13 @@ STALE = '20261107T080000Z-999'
 
 
 def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected_rc=0,
-             required=(), full_script=False, initial_input=''):
+             required=(), full_script=False, initial_input='', colored=(),
+             env_updates=None, plain_output=False):
     """Drive actual prompts; select displayed labels instead of fixed positions."""
     with tempfile.TemporaryDirectory() as directory:
         env = environment(directory)
+        env.pop('NO_COLOR', None)
+        env.update(env_updates or {})
         script = Path(directory) / 'case.sh'
         if full_script:
             # Keep CLI entry, child process and metadata wiring intact. Inject
@@ -199,6 +202,16 @@ def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected
         valid = rc == expected_rc and not absent and 'Что дальше' in output
         valid = valid and not any(re.search(item, option_labels, re.I) for item in forbidden)
         valid = valid and all(item in output for item in required)
+        # The meaning-bearing text itself must be inside the ANSI span: an
+        # unrelated colored heading must not satisfy a status-color assertion.
+        for color, pattern in colored:
+            spans = re.findall(rf'\x1b\[{color}m([^\x1b\r\n]*)\x1b\[0m', output)
+            if not any(re.search(pattern, text, re.I) for text in spans):
+                absent.append(f'missing color {color} around /{pattern}/')
+                valid = False
+        if plain_output and '\x1b' in output:
+            absent.append('ANSI emitted with color disabled')
+            valid = False
         if calls is not None:
             valid = valid and events.splitlines() == calls
         report(name, valid, f'rc={rc}; issues={absent}; chosen={picked}; calls={events}\n{output}')
@@ -211,6 +224,74 @@ menu_invoke() {
     return 0
 }
 '''
+
+# These exercise the real renderer in a terminal. Missing semantic color,
+# wrong severity, or coloring only the heading must fail these cases.
+pty_case('current PHP explanation is green', 'CURRENT=8.2.35\n' + child_stub,
+         'menu_action --check', forbidden=[AUTO],
+         colored=[(32, r'уже установлена|не требуется')])
+pty_case('available preparation is yellow while update is pending', child_stub,
+         'menu_action --check', colored=[(33, r'подготовк.*обновления')])
+for action, pattern in [('--check-site', r'Проверка.*сайта.*пройдена'),
+                        ('--setup-update', r'Настройки.*сохранены')]:
+    pty_case(action + ' successful outcome is green', child_stub,
+             'menu_action ' + action, colored=[(32, pattern)])
+
+for setting, pattern in [('BAD_APACHE=1', r'mod_php'),
+                         ('RPM_COMMON=8.2.19', r'Пакеты PHP.*не согласованы')]:
+    pty_case(setting + ' blocked explanation is red', setting + '\n' + child_stub,
+             'menu_action --check', forbidden=[AUTO], colored=[(31, pattern)])
+
+for setting in ['PHP_FAIL=1', 'CURRENT=8.3.36RC1']:
+    pty_case(setting + ' unknown PHP explanation is yellow', setting + '\n' + child_stub,
+             'menu_action --check', forbidden=[AUTO],
+             colored=[(33, r'Версия PHP не определена')])
+
+for action, pattern in [('--check-site', r'Проверка сайта отменена'),
+                        ('--setup-update', r'Настройка отменена'),
+                        ('--update', r'Операция отменена')]:
+    pty_case(action + ' cancellation is yellow', child_stub.replace('return 0', 'return 12'),
+             'menu_action ' + action, colored=[(33, pattern)])
+
+for state, rc, color, pattern in [
+    ('completed', 0, 32, r'Обновление завершено'),
+    ('already_current', 0, 32, r'Обновление не требуется'),
+    ('rollback_completed', 0, 32, r'Откат завершён'),
+    ('installation_failed', 62, 31, r'Установка.*ошибкой'),
+    ('verify_failed', 64, 31, r'проверка результата не завершена'),
+    ('unknown_state', 0, 33, r'Состояние не подтверждено'),
+    ('started', 0, 33, r'Подготовка операции'),
+]:
+    state_stub = child_stub.replace("MENU_STATE=''", 'MENU_STATE=' + state)
+    pty_case(state + ' operation summary uses semantic color',
+             state_stub.replace('return 0', f'return {rc}'),
+             'menu_action --update', colored=[(color, pattern)])
+
+pty_case('error and warning prefixes receive red and yellow', child_stub,
+         "err color-error; warn color-warning; menu_action --check",
+         colored=[(31, 'ОШИБКА: color-error'), (33, 'ВНИМАНИЕ: color-warning')])
+pty_case('failed operation without metadata is red',
+         child_stub.replace('return 0', 'return 51'), 'menu_action --update',
+         colored=[(31, r'Операция остановлена')])
+
+for settings in [{'NO_COLOR': '1'}, {'TERM': 'dumb'}]:
+    pty_case(str(settings) + ' disables terminal color', 'CURRENT=8.2.35\n' + child_stub,
+             'err color-error; warn color-warning; menu_action --check',
+             env_updates=settings, plain_output=True,
+             required=['ОШИБКА: color-error', 'ВНИМАНИЕ: color-warning'])
+
+shell_case('captured messages preserve streams and prefixes without ANSI', r'''
+err color-error > "$OUTPUT" 2> "$ROOT/errors"
+warn color-warning >> "$OUTPUT" 2>> "$ROOT/errors"
+[ ! -s "$OUTPUT" ] || exit 1
+grep -Fxq 'ОШИБКА: color-error' "$ROOT/errors" || exit 1
+grep -Fxq 'ВНИМАНИЕ: color-warning' "$ROOT/errors" || exit 1
+status_line ok color-success >> "$OUTPUT"
+menu_state_text completed >> "$OUTPUT"
+CURRENT=8.2.35
+menu_next_actions --check 0 <<< 0 >> "$OUTPUT"
+case "$(cat "$OUTPUT" "$ROOT/errors")" in *$'\033'*) exit 1 ;; esac
+''')
 
 # Catches broken wiring between the real manual menu, internal CLI result
 # channel, site selection and a subsequent child process. Only external site
@@ -274,7 +355,8 @@ failed_web = site_once.replace('    return 0',
                                '    if [ "$1" = --check-site ]; then MENU_WEB=failed; return 85; fi\n    return 0')
 pty_case('failed web check remains blocked after viewing plan', failed_web,
          'menu_action --check-site', [PLAN], forbidden=[AUTO],
-         calls=['CALL|--check-site', 'CALL|--plan'])
+         calls=['CALL|--check-site', 'CALL|--plan'],
+         colored=[(31, r'PHP сайта.*не подтверждён')])
 
 failed_prepare = f'''
 UPDATER_STATE="$ROOT/state"
