@@ -19,7 +19,7 @@ assert marker in installer, 'installer dispatch marker not found'
 prefix = installer.split(marker, 1)[0]
 assert 'setup_auto_update() (' in prefix, 'setup function not found'
 setup_function = prefix.split('setup_auto_update() (', 1)[1]
-project_source = re.search(r"local source='([^']+)'", setup_function).group(1)
+project_source = 'https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.2.35-el7-r1'
 original_key_hash = re.search(r"local expected_key='([0-9a-f]{64})'", setup_function).group(1)
 fixture_key = b'isolated setup key fixture; never a real signing key\n'
 key_hash = hashlib.sha256(fixture_key).hexdigest()
@@ -27,7 +27,7 @@ prefix = prefix.replace("expected_key='" + original_key_hash + "'", "expected_ke
 failures = 0
 site_record = 'http|site.example|80|/var/www/site'
 other_record = 'http|other.example|80|/var/www/other'
-for scenario in ('fresh', 'explicit_site', 'existing_saved_site', 'interactive_existing_site', 'existing_custom_source',
+for scenario in ('fresh', 'php83', 'explicit_site', 'existing_saved_site', 'interactive_existing_site', 'existing_custom_source',
                  'wrong_key_preserves', 'failed_health', 'ambiguous_sites', 'selection_cancelled',
                  'unsafe_config', 'unsafe_keydir', 'symlink_config', 'symlink_keydir',
                  'failed_save_preserves_pair', 'reuse_pinned_key', 'unsafe_pinned_key', 'corrupt_pinned_key'):
@@ -71,9 +71,11 @@ for scenario in ('fresh', 'explicit_site', 'existing_saved_site', 'interactive_e
             keydir.symlink_to(real)
         copied=prefix.replace("config='/etc/bitrix-php-update.conf'", f"config='{config}'").replace("keydir='/etc/bitrix-php-update'", f"keydir='{keydir}'")
         stubs=r'''
-profile_check() { return 0; }
+current=8.2.20
+[ "$SCENARIO" != php83 ] || current=8.3.8
+profile_check() { select_php_target_for_version "$current"; }
 need() { return 0; }
-php() { printf '8.2.20'; }
+php() { printf '%s' "$current"; }
 validate_managed_site() {
     [[ "$1" = 'http|site.example|80|/var/www/site' || "$1" = 'http|other.example|80|/var/www/other' ]]
 }
@@ -90,7 +92,7 @@ select_managed_site() {
     esac
 }
 http_check() {
-    [ "$1" = auto ] && [ "$2" = 8.2.20 ] && validate_managed_site "$MANAGED_SITE" || return 1
+    [ "$1" = auto ] && [ "$2" = "$current" ] && validate_managed_site "$MANAGED_SITE" || return 1
     printf '%s\n' "$MANAGED_SITE" > "$PROBE"
     [ "$SCENARIO" != failed_health ]
 }
@@ -125,10 +127,11 @@ exit $?
         output=child.stdout
         code=child.returncode
         try:
-            if scenario in ('fresh','explicit_site','existing_saved_site','interactive_existing_site','existing_custom_source','reuse_pinned_key'):
+            if scenario in ('fresh','php83','explicit_site','existing_saved_site','interactive_existing_site','existing_custom_source','reuse_pinned_key'):
                 assert code==0, f'exit {code}'
                 data=dict(line.split('=',1) for line in config.read_text().splitlines())
-                assert data['SOURCE']==project_source, 'custom source paired with project key'
+                wanted_source = 'https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.3.36-el7-r1' if scenario == 'php83' else project_source
+                assert data['SOURCE']==wanted_source, 'wrong project branch or custom source paired with project key'
                 assert data['HEALTH_URL']=='auto'
                 expected_site = other_record if scenario in ('explicit_site','existing_saved_site') else site_record
                 assert data['SITE']==expected_site

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Bitrix Server Master 1.0.0-rc9 — диагностика и пилотное обновление PHP 8.2.35.
+# Bitrix Server Master 1.0.0-rc10 — диагностика и обновление PHP 8.2.35 / 8.3.36.
 set -o pipefail
 umask 077
 export LC_ALL=C
-MASTER_VERSION='1.0.0-rc9'
+MASTER_VERSION='1.0.0-rc10'
 MANAGED_SITE=''
 PY_RELEASE='3.11.18'
 PY_BUILD='20261026'
@@ -166,7 +166,7 @@ bootstrap_python() {
 # Ничего не устанавливает; не опрашивает сетевые ресурсы.
 fallback_diagnose() {
     local json=0 report='' check=0 offline=0 args=("$@") x osname= arch= phpv= bitrix= apache= nginx= droot= mem= hostname_local
-    local os_id os_major first_version
+    local os_id os_major first_version route
     for ((x=0;x<${#args[@]};x++)); do
         case "${args[x]}" in
             --json) json=1 ;;
@@ -186,6 +186,8 @@ fallback_diagnose() {
     arch="$(uname -m)"
     phpv="$(php -v 2>/dev/null | awk '$1 == "PHP" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+_-]*$/ && !found {print $2; found=1}')" || phpv=''
     [ -n "$phpv" ] || phpv='не обнаружен'
+    select_php_target_for_version "$phpv" || true
+    route="$(php_version_route "$phpv")"
     apache="$(systemctl is-active httpd 2>/dev/null || true)"
     nginx="$(systemctl is-active nginx 2>/dev/null || true)"
     droot="$(df -h / 2>/dev/null | awk 'NR==2 {print $4}')"
@@ -206,7 +208,11 @@ fallback_diagnose() {
         echo '======================================================'
         echo "BITRIX SERVER MASTER $MASTER_VERSION — ОГРАНИЧЕННАЯ ДИАГНОСТИКА"
         echo '======================================================'
-        if [[ "$phpv" == "$TARGET_PHP" ]]; then
+        if [ "$route" = unsupported ]; then
+            status_line warning "PHP CLI $phpv — обновление этой ветки не поддерживается (только 8.2.x и 8.3.x)"
+        elif [ "$route" = older ]; then
+            status_line warning "PHP CLI $phpv — для перехода на PHP 8.2 нужен отдельный маршрут (--plan)"
+        elif [[ "$phpv" == "$TARGET_PHP" ]]; then
             status_line ok "PHP CLI $phpv — обновление до целевой версии не требуется"
         elif [[ "$phpv" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             first_version="$(printf '%s\n' "$phpv" "$TARGET_PHP" | sort -V | head -n 1)"
@@ -265,10 +271,32 @@ fallback_diagnose() {
 # Bitrix Server Master — обновление для строго определённого профиля CentOS 7.
 # Код Bash не требует Python и никогда не исполняет содержимое сайта.
 # =============================================================================
-TARGET_PHP='8.2.35'
-TARGET_PHP_SHA='5737b98601fe5ab1b8c5db0c82ed3158acb9283ed3081ffe2faffb9ac81455e6'
-SRC_RPM_URL='https://rpms.remirepo.net/SRPMS/php-8.2.35-1.remi.src.rpm'
-SRC_RPM_SHA256='3e378af07d6beae83e507ba7331fbf70851cd365940a07a69ce6e3fc7fc35c00'
+# Доверенная карта целей: клиент не выбирает другую ветку через аргументы.
+set_php_target() {
+    case "$1" in
+        8.2)
+            TARGET_PHP='8.2.35'
+            TARGET_PHP_SHA='5737b98601fe5ab1b8c5db0c82ed3158acb9283ed3081ffe2faffb9ac81455e6'
+            SRC_RPM_SHA256='3e378af07d6beae83e507ba7331fbf70851cd365940a07a69ce6e3fc7fc35c00'
+            TARGET_SPEC='php82.spec'
+            ;;
+        8.3)
+            TARGET_PHP='8.3.36'
+            TARGET_PHP_SHA='dd54693aa334c5c4d72e9aee96b082c2473750a18a6c1d105789c93a3b1692fd'
+            SRC_RPM_SHA256='9a8fbff91b8a79cf82aa2405b70d086e6c313d2575a9d9040866cac7d2d0d87f'
+            TARGET_SPEC='php83.spec'
+            ;;
+        *) err 'Поддерживаются только ветки PHP 8.2 и 8.3.'; return 2 ;;
+    esac
+    TARGET_BRANCH="$1"
+    SRC_RPM_URL="https://rpms.remirepo.net/SRPMS/php-$TARGET_PHP-1.remi.src.rpm"
+    PROJECT_RELEASE_URL="https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-$TARGET_PHP-el7-r1"
+}
+select_php_target_for_version() {
+    [[ "$1" =~ ^8\.[23]\.[0-9]+$ ]] || return 20
+    set_php_target "${1%.*}"
+}
+set_php_target 8.2
 UPDATER_STATE='/var/lib/bitrix-server-master'
 UPDATER_LOG='/var/log/bitrix-server-master'
 WORK_ROOT='/var/lib/bitrix-server-master/work'
@@ -316,13 +344,46 @@ platform_check() {
     [ "$(uname -m)" = x86_64 ] || { err 'Поддерживается только x86_64.'; return 20; }
 }
 
+bitrix_env_rpm_guard() {
+    local package records version query_rc found=''
+    for package in bitrix-env bitrix-env-crm; do
+        query_rc=0
+        # Маркер сохраняет завершающие переводы строк: пустой второй RPM
+        # не должен исчезнуть при подстановке команды. PHP здесь не нужен.
+        records="$(rpm -q --qf '%{VERSION}\n' "$package" 2>&1; query_rc=$?; printf '.'; exit "$query_rc")" || query_rc=$?
+        records="${records%.}"
+        if [ "$query_rc" -ne 0 ]; then
+            if [ "$query_rc" -eq 1 ] &&
+               { [ "$records" = "package $package is not installed" ] ||
+                 [ "$records" = "package $package is not installed"$'\n' ]; }; then
+                continue
+            fi
+            err "Не удалось прочитать RPM окружения $package (код $query_rc)."; return 20
+        fi
+        version="${records%$'\n'}"
+        if [ "$records" != "$version"$'\n' ] || ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            err "Неоднозначные или некорректные метаданные RPM окружения $package."; return 20
+        fi
+        if [ "${version%%.*}" != 7 ]; then
+            err "Обновление BitrixEnv $version не поддерживается; нужен профиль BitrixEnv 7."; return 20
+        fi
+        if [ -n "$found" ]; then
+            err 'Обнаружено несколько RPM окружения BitrixEnv; профиль неоднозначен.'; return 20
+        fi
+        found="$package"
+    done
+    # Старые установки без RPM окружения сохраняют прежнюю совместимость.
+    return 0
+}
+
 profile_check() {
     local cur p_php p_cli apache package_kinds
     platform_check || return
     [ -d /etc/httpd/bx ] || { err 'Конфигурация BitrixEnv /etc/httpd/bx не обнаружена.'; return 20; }
     need rpm php httpd systemctl awk grep sed || return 20
+    bitrix_env_rpm_guard || return
     cur="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || { err 'PHP CLI не отвечает.'; return 20; }
-    [[ "$cur" =~ ^8\.2\.[0-9]+$ ]] || { err "Обновление поддерживает только ветку PHP 8.2.x (найдено: $cur)."; return 20; }
+    select_php_target_for_version "$cur" || { err "Обновление поддерживает только ветки PHP 8.2.x и 8.3.x (найдено: $cur). Для старых версий выполните --plan."; return 20; }
     p_php="$(rpm -q --qf '%{VERSION}' php 2>/dev/null)" || { err 'RPM php не установлен.'; return 20; }
     p_cli="$(rpm -q --qf '%{VERSION}' php-cli 2>/dev/null)" || { err 'RPM php-cli не установлен.'; return 20; }
     [[ "$p_php" = "$cur" && "$p_cli" = "$cur" ]] || { err "Версии CLI ($cur) и RPM php/php-cli ($p_php/$p_cli) различаются."; return 20; }
@@ -459,12 +520,13 @@ php_version_route() {
     major="${BASH_REMATCH[1]}"
     minor="${BASH_REMATCH[2]}"
     patch="${BASH_REMATCH[3]}"
-    if [ "$version" = "$TARGET_PHP" ]; then
-        echo target
-    elif [ "$major" -gt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -gt 2 ]; }; then
-        echo newer
-    elif [ "$major" -eq 8 ] && [ "$minor" -eq 2 ]; then
-        if [ "$patch" -ge "${TARGET_PHP##*.}" ]; then echo newer; else echo patch; fi
+    if [ "$major" -gt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -gt 3 ]; }; then
+        echo unsupported
+    elif [ "$major" -eq 8 ] && { [ "$minor" -eq 2 ] || [ "$minor" -eq 3 ]; }; then
+        set_php_target "$major.$minor" || return
+        if [ "$version" = "$TARGET_PHP" ]; then echo target
+        elif [ "$((10#$patch))" -ge "${TARGET_PHP##*.}" ]; then echo newer
+        else echo patch; fi
     else
         echo older
     fi
@@ -655,6 +717,7 @@ quick_check() {
 
     printf 'BITRIX SERVER MASTER %s — быстрая проверка\n' "$MASTER_VERSION"
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
+    select_php_target_for_version "$cli" || true
     route="$(php_version_route "$cli")"
     case "$route" in
         unknown)
@@ -670,6 +733,7 @@ quick_check() {
             status_line warning "PHP CLI $cli. Для перехода на PHP 8.2 нужен отдельный маршрут."
             next_action='--plan'
             ;;
+        unsupported) status_line warning "PHP CLI $cli. Обновление этой ветки не поддерживается; доступны только 8.2.x и 8.3.x." ;;
         newer) status_line info "PHP CLI $cli. Понижение до $TARGET_PHP не предусмотрено." ;;
         target) target_php_status || next_action='--audit --offline' ;;
         patch)
@@ -721,9 +785,10 @@ show_plan() {
     local cli route detail='' profile_rc=20
     printf 'BITRIX SERVER MASTER %s — план обновления\n' "$MASTER_VERSION"
     cli="$(php -r 'echo PHP_VERSION;' 2>/dev/null)" || cli=''
+    select_php_target_for_version "$cli" || true
     route="$(php_version_route "$cli")"
     status_line info 'Веб-PHP не проверялся. Автоматическая временная проверка: bash install.sh --check-site (от root).'
-    if [[ "$cli" =~ ^8\.2\.[0-9]+$ ]]; then
+    if [[ "$cli" =~ ^8\.[23]\.[0-9]+$ ]]; then
         if detail="$(profile_check 2>&1)"; then
             profile_rc=0
             printf '%s\n' "$detail"
@@ -734,6 +799,10 @@ show_plan() {
         fi
     fi
     case "$route" in
+        unsupported)
+            status_line warning "Обновление PHP $cli не поддерживается. Мастер устанавливает патчи только внутри веток 8.2 и 8.3."
+            show_os_status
+            return 20 ;;
         target)
             if [ "$profile_rc" -eq 0 ]; then target_php_status || profile_rc=$?; else target_php_status || true; fi
             show_os_status
@@ -760,6 +829,7 @@ show_plan() {
         status_line info 'Следующий шаг: bash install.sh --audit --offline'
         return 20
     fi
+    status_line info "План обновления: PHP $cli → $TARGET_PHP (ветка $TARGET_BRANCH)."
     cat <<'EOF'
 1. Проверьте резервную копию или снимок ВМ и доступ к консоли гипервизора.
 2. На клоне от root выполните --check-site и выберите сайт для временной проверки.
@@ -769,7 +839,7 @@ show_plan() {
 5. Выполните откат по ID исходной сессии и подтвердите работу прежнего PHP и сайта.
 6. Согласуйте окно обслуживания и повторите проверенную процедуру.
 Если точного старого RPM нет в выпуске, владелец должен добавить его в подписанный архив.
-CentOS 7 снята с поддержки. Поддержка PHP 8.2 завершается 31.12.2026.
+CentOS 7 снята с поддержки. Обновление PHP не восстанавливает поддержку ОС.
 EOF
 }
 
@@ -816,30 +886,82 @@ make_openssl_patch() {
     msg 'Патч совместимости OpenSSL подготовлен и проверен.'
 }
 
-prepare_spec() {
-    local root="$1" spec="$1/SPECS/php82.spec" new="$1/SPECS/php82.modified.spec"
-    [ -f "$spec" ] || { err "Не найден php82.spec в $root/SPECS."; return 31; }
-    cp "$spec" "$spec.original"
-    if ! grep -q '^Patch302:' "$spec" || ! grep -q '^%patch -P302' "$spec"; then
-        err 'Структура spec изменилась: не удалось найти Patch302.'; return 31
+# Replacements for the build/source functions in install.sh.
+# Relies on the fixed set_php_target profile map and make_openssl_patch.
+make_el7_ffi_patch() {
+    local tarball="$1" dest="$2" temp orig edited result
+    need tar grep sed diff patch || return
+    temp="$(mktemp -d "$WORK_ROOT/ffi-fix.XXXXXXXX")" || return
+    if ! tar -xJf "$tarball" -C "$temp" "php-$TARGET_PHP/ext/ffi/ffi.c"; then
+        err 'Не удалось извлечь ext/ffi/ffi.c'; rm -rf -- "$temp"; return 30
     fi
-    # Специфично для исходного Remi php82.spec на 8.2.35.
-    awk '
+    orig="$temp/php-$TARGET_PHP/ext/ffi/ffi.c"
+    edited="$temp/edited.c"
+    if [ "$(grep -c 'strncmp(.*ZEND_STRL(' "$orig")" != 3 ]; then
+        err 'В FFI изменились ожидаемые точки совместимости glibc EL7.'; rm -rf -- "$temp"; return 30
+    fi
+    sed -e 's/ZEND_STRL("#define")/"#define", sizeof("#define") - 1/' \
+        -e 's/ZEND_STRL("FFI_SCOPE")/"FFI_SCOPE", sizeof("FFI_SCOPE") - 1/' \
+        -e 's/ZEND_STRL("FFI_LIB")/"FFI_LIB", sizeof("FFI_LIB") - 1/' \
+        "$orig" > "$edited" || { rm -rf -- "$temp"; return 30; }
+    diff -u --label a/ext/ffi/ffi.c --label b/ext/ffi/ffi.c "$orig" "$edited" > "$dest"
+    result=$?
+    if [ "$result" != 1 ] || ! patch --dry-run --fuzz=0 -d "$temp/php-$TARGET_PHP" -p1 < "$dest" >/dev/null 2>&1; then
+        err 'Ошибка проверки патча FFI для glibc EL7.'; rm -rf -- "$temp"; return 30
+    fi
+    rm -rf -- "$temp"
+    msg 'Патч совместимости FFI с glibc EL7 подготовлен и проверен.'
+}
+
+prepare_spec() {
+    local root="$1" spec="$1/SPECS/$TARGET_SPEC" new="$1/SPECS/$TARGET_SPEC.modified" anchor
+    case "$TARGET_BRANCH" in
+        8.2) anchor=302 ;;
+        8.3) anchor=49 ;;
+        *) err 'Неподдерживаемая ветка исходников PHP.'; return 31 ;;
+    esac
+    [ -f "$spec" ] || { err "Не найден $TARGET_SPEC в $root/SPECS."; return 31; }
+    cp -- "$spec" "$spec.original" || return
+    if ! grep -q "^Patch$anchor:" "$spec" || ! grep -q "^%patch -P$anchor " "$spec"; then
+        err "Структура spec изменилась: не удалось найти Patch$anchor."; return 31
+    fi
+    # В 8.3 Patch49 находится вне условного блока tzdata: оба исправления обязательны.
+    awk -v anchor="$anchor" -v version="$TARGET_PHP" -v branch="$TARGET_BRANCH" '
     /^Release:[[:space:]]*1%\{\?dist\}/ { sub(/1%\{\?dist\}/, "1%{?dist}.1") }
     /^BuildRequires:[[:space:]]*pkgconfig\(icu-(i18n|io|uc)\)[[:space:]]*>= 74/ { sub(/>= 74/, ">= 73") }
-    /^Patch302:/ { print; print "Patch900: php-8.2.35-openssl102-asn1.patch"; next }
-    /^%patch -P302/ { print; print "%patch -P900 -p1 -b .openssl102"; next }
+    /^BuildRequires:[[:space:]]*pkgconfig\(odbc\)/ { sub(/pkgconfig\(odbc\)/, "unixODBC-devel") }
+    $0 ~ "^Patch" anchor ":" {
+        print; print "Patch900: php-" version "-openssl102-asn1.patch"
+        if (branch == "8.3") print "Patch901: php-" version "-el7-glibc-strncmp.patch"
+        next
+    }
+    $0 ~ "^%patch -P" anchor " " {
+        print; print "%patch -P900 -p1 -b .openssl102"
+        if (branch == "8.3") print "%patch -P901 -p1 -b .glibc-strncmp"
+        next
+    }
     {print}
     ' "$spec" > "$new" || return
     if ! grep -q '^Patch900:' "$new" || ! grep -q '^%patch -P900' "$new" || ! grep -q '>= 73' "$new"; then
         err 'Не удалось корректно модифицировать spec.'; return 31
     fi
-    mv -f "$new" "$spec"
+    if [ "$TARGET_BRANCH" = 8.3 ] && { ! grep -q '^Patch901:' "$new" || ! grep -q '^%patch -P901 ' "$new"; }; then
+        err 'Не удалось добавить обязательный патч FFI для glibc EL7.'; return 31
+    fi
+    mv -f -- "$new" "$spec" || return
     msg "Спецификация адаптирована: $spec"
 }
 
 source_prepare() {
-    local dir="$1" src="$2" top keyring sig status fingerprint
+    local dir="$1" src="$2" top keyring sig status fingerprint primary expected_signer expected_primary=''
+    case "$TARGET_BRANCH" in
+        8.2) expected_signer='E60913E4DF209907D8E30D96659A97C9CF2A795A' ;;
+        8.3)
+            expected_signer='4B1FC0D9DF92321CED9F615DBEC555E22A143553'
+            expected_primary='AFD8691FDAEDF03BDF6E460563F15A9B715376CA'
+            ;;
+        *) err 'Неподдерживаемая ветка исходников PHP.'; return 30 ;;
+    esac
     need rpm2cpio cpio sha256sum rpm rpmbuild gpg tar patch diff readlink || return
     mkdir -p -- "$dir" || return
     dir="$(readlink -f -- "$dir")" || return 30
@@ -851,11 +973,10 @@ source_prepare() {
     else
         safe_download "$SRC_RPM_URL" "$dir/remi.src.rpm" || return
     fi
-    # Проверяем весь SRPM, включая spec, патчи и ключи, до открытия его payload.
+    # Полный доверенный SRPM включает spec, патчи и публичный keyring.
     if ! (cd -- "$dir" && printf '%s  remi.src.rpm\n' "$SRC_RPM_SHA256" | sha256sum -c -); then
         err 'SHA-256 SRPM не совпал с закреплённым значением Remi. Распаковка запрещена.'; return 30
     fi
-    # Не разрешаем распаковку файлов SRPM за пределы изолированного каталога.
     local entries="$dir/source-entries.txt"
     if ! (rpm2cpio "$dir/remi.src.rpm" | cpio -it --quiet) > "$entries" 2>"$dir/source-list-errors.log"; then
         err 'Не удалось прочитать перечень файлов SRPM.'; return 30
@@ -866,12 +987,11 @@ source_prepare() {
     ' "$entries"; then
         err 'В SRPM обнаружены недопустимые пути; распаковка отменена.'; return 30
     fi
-    # Отдельно проверяем SHA-256 и подпись исходного архива PHP.
-    if ! (cd "$top/SOURCES" && rpm2cpio "$dir/remi.src.rpm" | cpio -idm --quiet) ; then
+    if ! (cd "$top/SOURCES" && rpm2cpio "$dir/remi.src.rpm" | cpio -idm --quiet); then
         err 'Не удалось извлечь содержимое SRPM.'; return 30
     fi
-    [ -f "$top/SOURCES/php82.spec" ] || { err 'Не найден php82.spec в SRPM.'; return 30; }
-    cp "$top/SOURCES/php82.spec" "$top/SPECS/php82.spec" || return
+    [ -f "$top/SOURCES/$TARGET_SPEC" ] || { err "Не найден $TARGET_SPEC в SRPM."; return 30; }
+    cp -- "$top/SOURCES/$TARGET_SPEC" "$top/SPECS/$TARGET_SPEC" || return
     [ -f "$top/SOURCES/php-$TARGET_PHP.tar.xz" ] || { err 'В SRPM отсутствует исходник нужной версии.'; return 30; }
     printf '%s  %s\n' "$TARGET_PHP_SHA" "$top/SOURCES/php-$TARGET_PHP.tar.xz" | sha256sum -c - || {
         err 'Контрольная сумма исходников PHP не совпала.'; return 30;
@@ -880,22 +1000,27 @@ source_prepare() {
     keyring="$top/SOURCES/php-keyring.gpg"
     [ -f "$sig" ] && [ -f "$keyring" ] || { err 'Не найдены подпись PHP и keyring.'; return 30; }
     mkdir -m 0700 "$dir/gnupg" || return
-    # GnuPG EL7 может пропустить отдельные ключи из общего PHP keyring.
-    # Решающее условие — проверенная подпись с закреплённым отпечатком ниже.
+    # EL7 GnuPG может пропустить другие ключи общего PHP keyring.
+    # Проверенная подпись и точные отпечатки ниже остаются обязательными.
     gpg --homedir "$dir/gnupg" --batch --quiet --import "$keyring" > "$dir/source-keyring-import.log" 2>&1 ||
         warn "GPG завершил импорт с замечаниями. См. $dir/source-keyring-import.log"
     status="$(gpg --homedir "$dir/gnupg" --batch --status-fd 1 --verify "$sig" "$top/SOURCES/php-$TARGET_PHP.tar.xz" 2>&1)" || {
         err 'GPG-подпись исходников PHP не подтверждена.'; return 30;
     }
-    printf '%s\n' "$status" | grep -q 'GOODSIG' || { err 'GPG не подтвердил подпись.'; return 30; }
+    printf '%s\n' "$status" > "$dir/source-gpg-verification.log" || return
+    printf '%s\n' "$status" | grep -q '^\[GNUPG:\] GOODSIG ' || { err 'GPG не подтвердил подпись.'; return 30; }
     fingerprint="$(printf '%s\n' "$status" | awk '/^\[GNUPG:\] VALIDSIG / {print $3; exit}')"
-    [ "$fingerprint" = 'E60913E4DF209907D8E30D96659A97C9CF2A795A' ] || {
-        err "Неожиданный ключ подписи PHP: $fingerprint"; return 30;
-    }
+    primary="$(printf '%s\n' "$status" | awk '/^\[GNUPG:\] VALIDSIG / {print $12; exit}')"
+    if [ "$fingerprint" != "$expected_signer" ] || { [ -n "$expected_primary" ] && [ "$primary" != "$expected_primary" ]; }; then
+        err "Неожиданный ключ подписи PHP: $fingerprint (основной: $primary)."; return 30
+    fi
     msg 'SHA-256 и GPG-подпись исходников PHP подтверждены.'
-    make_openssl_patch "$top/SOURCES/php-$TARGET_PHP.tar.xz" "$top/SOURCES/php-8.2.35-openssl102-asn1.patch" || return
+    make_openssl_patch "$top/SOURCES/php-$TARGET_PHP.tar.xz" "$top/SOURCES/php-$TARGET_PHP-openssl102-asn1.patch" || return
+    if [ "$TARGET_BRANCH" = 8.3 ]; then
+        make_el7_ffi_patch "$top/SOURCES/php-$TARGET_PHP.tar.xz" "$top/SOURCES/php-$TARGET_PHP-el7-glibc-strncmp.patch" || return
+    fi
     prepare_spec "$top" || return
-    if ! rpmbuild -bp --nodeps --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$dir/prep.log" 2>&1; then
+    if ! rpmbuild -bp --nodeps --define "_topdir $top" --define 'dist .el7' "$top/SPECS/$TARGET_SPEC" > "$dir/prep.log" 2>&1; then
         err "Ошибка подготовки исходников. См. $dir/prep.log"; tail -n 25 "$dir/prep.log"; return 31
     fi
     msg 'Проверка подготовки исходников RPM (%prep) прошла.'
@@ -905,7 +1030,7 @@ source_prepare() {
 build_rpms() {
     local from_srpm="$1" allow_builder="$2" top missing=0 work
     require_root || return
-    profile_check || return
+    platform_check || return
     if [ "${PHP_CURRENT:-}" = "$TARGET_PHP" ]; then
         warn 'PHP уже обновлён, сборка необязательна, но может использоваться для распространения пакетов.'
     fi
@@ -928,16 +1053,16 @@ build_rpms() {
     source_prepare "$work" "$from_srpm" || { mark_state failed_prepare; return 41; }
     top="$work/rpmbuild"
     msg 'Проверка зависимостей сборки...'
-    if ! rpmbuild -br --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/buildrequires.log" 2>&1; then
+    if ! rpmbuild -br --define "_topdir $top" --define 'dist .el7' "$top/SPECS/$TARGET_SPEC" > "$work/buildrequires.log" 2>&1; then
         # -br в старом rpmbuild может не поддерживаться: используем проверку -bp без --nodeps.
-        if rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/dependencies-check.log" 2>&1; then
+        if rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/$TARGET_SPEC" > "$work/dependencies-check.log" 2>&1; then
             missing=0
         else
             missing=1
         fi
     else
         # -br может создать SRPM; точный список всё равно проверяем.
-        if ! rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/dependencies-check.log" 2>&1; then missing=1; fi
+        if ! rpmbuild -bp --define "_topdir $top" --define 'dist .el7' "$top/SPECS/$TARGET_SPEC" > "$work/dependencies-check.log" 2>&1; then missing=1; fi
     fi
     if [ "$missing" -eq 1 ]; then
         msg 'Для сборки не хватает зависимостей:'
@@ -945,13 +1070,13 @@ build_rpms() {
         need yum-builddep || { err 'Для зависимостей требуется yum-utils и команда yum-builddep.'; return 42; }
         echo 'Команда yum-builddep может обновить systemd, curl и другие критические пакеты на сборочной ВМ.'
         confirm_phrase 'Разрешить установку build-зависимостей НА КЛОНЕ после предварительного просмотра транзакции?' 'РАЗРЕШАЮ НА КЛОНЕ' || return
-        yum-builddep --assumeno "$top/SPECS/php82.spec" 2>&1 | tee "$work/builddeps-preview.log" || true
+        yum-builddep --assumeno "$top/SPECS/$TARGET_SPEC" 2>&1 | tee "$work/builddeps-preview.log" || true
         confirm_phrase 'Транзакция показана выше. Запустить её НА КЛОНЕ?' 'ВЫПОЛНИТЬ НА КЛОНЕ' || return
-        yum-builddep -y "$top/SPECS/php82.spec" || { err 'Установка build-зависимостей завершилась ошибкой.'; mark_state failed_deps; return 42; }
+        yum-builddep -y "$top/SPECS/$TARGET_SPEC" || { err 'Установка build-зависимостей завершилась ошибкой.'; mark_state failed_deps; return 42; }
     fi
     msg 'Компиляция и создание RPM. Подробности: build.log'
     mark_state building
-    if ! rpmbuild -ba --define "_topdir $top" --define 'dist .el7' "$top/SPECS/php82.spec" > "$work/build.log" 2>&1; then
+    if ! rpmbuild -ba --define "_topdir $top" --define 'dist .el7' "$top/SPECS/$TARGET_SPEC" > "$work/build.log" 2>&1; then
         err 'Компиляция не прошла, последние строки:'; tail -n 35 "$work/build.log"; mark_state failed_build; return 43
     fi
     if ! ls "$top/RPMS/x86_64/php-$TARGET_PHP"-*.rpm >/dev/null 2>&1; then
@@ -965,7 +1090,6 @@ build_rpms() {
     echo 'Подпиши SHA256SUMS отделённой ASCII-подписью доверенного ключа вне сборочной ВМ.'
     echo 'Передай весь каталог RPM вместе с SHA256SUMS и SHA256SUMS.asc.'
 }
-
 
 # Полная установленная NEVRA нужна для проверки обновления и точного отката.
 RPM_RECORD_QF='%{NAME}|%{EPOCH}|%{VERSION}|%{RELEASE}|%{ARCH}\n'
@@ -1109,6 +1233,14 @@ load_auto_config() {
     if ! [[ "$AUTO_SOURCE" == /* || "$AUTO_SOURCE" =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?(/[a-zA-Z0-9_./~%+@=-]*)?$ ]]; then
         err 'SOURCE должен быть абсолютным путём или HTTPS-адресом каталога без учётных данных и параметров.'; return 80
     fi
+    # Только точные адреса выпусков проекта переносятся на выбранную ветку.
+    # Пользовательский источник сохраняется буквально и проверяется как обычно.
+    case "$AUTO_SOURCE" in
+        https://github.com/vitikevich-landau/bitrix-php82-updater/releases/download/php-8.2.35-el7-r1|\
+        https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.2.35-el7-r1|\
+        https://github.com/vitikevich-landau/bitrix-php-updater/releases/download/php-8.3.36-el7-r1)
+            AUTO_SOURCE="$PROJECT_RELEASE_URL" ;;
+    esac
     if [ -n "$AUTO_SITE" ]; then validate_managed_site "$AUTO_SITE" || return 80; fi
     if [ "$AUTO_HEALTH_URL" != auto ]; then health_url_parts "$AUTO_HEALTH_URL" >/dev/null || return 80; fi
 }
@@ -1317,6 +1449,10 @@ select_rpms() {
             err "Некорректная запись в снимке RPM: $record"; return 50
         fi
         name="${BASH_REMATCH[1]}"
+        version="${BASH_REMATCH[3]}"
+        if [ "${version%.*}" != "$TARGET_BRANCH" ]; then
+            err "Ветка PHP в снимке RPM не совпадает с выбранной $TARGET_BRANCH: $record"; return 50
+        fi
         if ! [[ " $CORE_RPM_NAMES " == *" $name "* ]] || [ -n "${expected[$name]:-}" ]; then
             err "Недопустимый или повторный пакет в снимке RPM: $name"; return 50
         fi
@@ -1736,14 +1872,18 @@ run_update() {
 
 plan_rpm_rollback() {
     # Допустимы пропуск пакета и по одной точной записи из обоих наборов.
-    awk -F'|' '
+    awk -F'|' -v branch="$TARGET_BRANCH" '
         FILENAME == ARGV[1] {
+            split($3, version, ".")
+            if (NF != 5 || version[1] "." version[2] != branch) { invalid = 1; exit 1 }
             if ($1 in old) { invalid = 1; exit 1 }
             names[++n] = $1
             old[$1] = $0
             next
         }
         FILENAME == ARGV[2] {
+            split($3, version, ".")
+            if (NF != 5 || version[1] "." version[2] != branch) { invalid = 1; exit 1 }
             if (!($1 in old) || ($1 in target)) { invalid = 1; exit 1 }
             target[$1] = $0
             next
@@ -1828,6 +1968,7 @@ run_rollback() {
     source="$UPDATER_STATE/sessions/$id"
     printf '%s\n' "$id" > "$dir/rollback-of" || return 71
     platform_check || { mark_state rollback_precheck_failed; return 71; }
+    bitrix_env_rpm_guard || { mark_state rollback_precheck_failed; return 71; }
 
     if ! private_session_dir "$source" || ! private_session_dir "$source/rpm-rollback"; then
         err "Защищённая сессия обновления $id не найдена."
@@ -1847,6 +1988,11 @@ run_rollback() {
         *) err "Состояние «$state» не допускает отката RPM."; mark_state rollback_precheck_failed; return 71 ;;
     esac
     old_php="$(cat "$source/php-version-before.txt")" || return 71
+    if ! select_php_target_for_version "$old_php"; then
+        err 'В сессии не указана поддерживаемая исходная версия PHP.'
+        mark_state rollback_precheck_failed
+        return 71
+    fi
     MANAGED_SITE=''
     if [ -z "$url" ] && { [ -e "$source/site-probe" ] || [ -L "$source/site-probe" ]; }; then
         if ! managed_site_load "$source/site-probe"; then
@@ -1864,7 +2010,7 @@ run_rollback() {
         original_url="$(cat "$source/url")" || return 71
         url="$original_url"
     fi
-    if [[ ! "$old_php" =~ ^8\.2\.[0-9]+$ ]] || ! health_target_validate "$url"; then
+    if ! health_target_validate "$url"; then
         err 'В сессии не указана корректная версия PHP или цель проверки сайта.'
         mark_state rollback_precheck_failed
         return 71
@@ -1997,7 +2143,7 @@ show_status() {
 
 update_help() {
     cat <<'EOF'
-BITRIX SERVER MASTER 1.0.0-rc9 — диагностика и пилотное обновление PHP
+BITRIX SERVER MASTER 1.0.0-rc10 — диагностика и обновление PHP 8.2 / 8.3
 
 Проверка и отчёт
   bash install.sh --check
@@ -2018,7 +2164,9 @@ BITRIX SERVER MASTER 1.0.0-rc9 — диагностика и пилотное о
 --audit собирает данные, сверяет патч PHP с PHP.net и сохраняет JSON.
 --plan показывает цепочку перехода на PHP 8.2 для обнаруженного BitrixEnv.
 Переходы между ветками администратор запускает через меню /root/menu.sh.
-На подходящем PHP 8.2.x он показывает план установки патча до 8.2.35.
+На подходящем PHP 8.2.x он показывает патч до 8.2.35, на 8.3.x — до 8.3.36.
+Ветка определяется автоматически; переходов между ветками и понижения нет.
+PHP 8.4+ и обновление BitrixEnv 9 не поддерживаются.
 Цвета используются в терминале. NO_COLOR=1 отключает цвета.
 
 Подробные команды
@@ -2030,10 +2178,13 @@ BITRIX SERVER MASTER 1.0.0-rc9 — диагностика и пилотное о
 Сборка на отдельном клоне ВМ
   bash install.sh --build --builder
   bash install.sh --build --builder --srpm /path/php-8.2.35-1.remi.src.rpm
+  bash install.sh --build --builder --branch 8.3 --srpm /path/php-8.3.36-1.remi.src.rpm
 
 Подготовка выпуска на доверенной машине подписи
   bash install.sh --prepare-release --new-rpm-dir /path/NEW_RPMS --old-rpm-dir /path/OLD_RPMS \
        --signer FULL_RSA_FINGERPRINT --output /path/NEW_RELEASE
+Для выпуска PHP 8.3 добавьте --branch 8.3. По умолчанию выбрана 8.2.
+--branch разрешён только для --build и --prepare-release.
 
 Автоматическая загрузка и установка из выпуска проекта
   bash install.sh --setup-update
@@ -2070,7 +2221,8 @@ BITRIX_MASTER_OK <версия PHP> apache2handler.
   bash install.sh --version
 
 Профиль установки — CentOS 7 x86_64, Apache prefork + mod_php,
-пакетный PHP 8.2.x. Целевая версия — PHP 8.2.35. Первый прогон — на клоне.
+BitrixEnv 7, пакетный PHP 8.2.x или 8.3.x. Цели — PHP 8.2.35 / 8.3.36.
+Первый прогон — на клоне.
 EOF
 }
 
@@ -2156,8 +2308,8 @@ prepare_release() (
             release="${BASH_REMATCH[4]}"
             arch="${BASH_REMATCH[5]}"
             if ! [[ " $CORE_RPM_NAMES " == *" $name "* && "$arch" = x86_64 &&
-                    "$ver" =~ ^8\.2\.[0-9]+$ && "$release" =~ (^|\.)el7([._+~^-]|$) ]]; then
-                err "Неподходящий пакет для выпуска EL7 PHP 8.2 — $record"
+                    "$ver" =~ ^8\.[23]\.[0-9]+$ && "${ver%.*}" = "$TARGET_BRANCH" && "$release" =~ (^|\.)el7([._+~^-]|$) ]]; then
+                err "Неподходящий пакет для выпуска EL7 PHP $TARGET_BRANCH — $record"
                 return 50
             fi
             source_package="$(rpm -qp --nosignature --qf '%{SOURCEPACKAGE}' -- "$staged")" || return 50
@@ -2224,7 +2376,7 @@ prepare_release() (
 )
 
 prepare_release_dispatch() {
-    local new_dir='' old_dir='' signer='' output='' option
+    local new_dir='' old_dir='' signer='' output='' option branch=8.2
     while [ "$#" -gt 0 ]; do
         option="$1"
         if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
@@ -2232,6 +2384,7 @@ prepare_release_dispatch() {
             return 2
         fi
         case "$option" in
+            --branch) branch="$2" ;;
             --new-rpm-dir) new_dir="$2" ;;
             --old-rpm-dir) old_dir="$2" ;;
             --signer) signer="$2" ;;
@@ -2244,13 +2397,14 @@ prepare_release_dispatch() {
         err 'Укажите --new-rpm-dir, --old-rpm-dir, --signer и --output.'
         return 2
     fi
+    set_php_target "$branch" || return
     prepare_release "$new_dir" "$old_dir" "$signer" "$output"
 }
 
 
 updater_dispatch() {
     local mode="$1" rpmdir='' olddir='' keyring='' srpm='' url='' session='' builder=0 selector=''
-    local unattended=0 backup_verified=0
+    local unattended=0 backup_verified=0 branch=8.2
     MANAGED_SITE=''
     shift
     while [ "$#" -gt 0 ]; do
@@ -2271,12 +2425,13 @@ updater_dispatch() {
           --rollback:--rpm-dir)
             err 'Откат привязан к записанной сессии. Используйте --rollback --session ID.'
             return 2 ;;
-          --build:--srpm|--update:--rpm-dir|--update:--rollback-dir|--update:--rpm-keyring|--update:--url|--update:--site|--rollback:--session|--rollback:--url)
+          --build:--branch|--build:--srpm|--update:--rpm-dir|--update:--rollback-dir|--update:--rpm-keyring|--update:--url|--update:--site|--rollback:--session|--rollback:--url)
             if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
                 err "У параметра $1 нет значения."
                 return 2
             fi
             case "$1" in
+              --branch) branch="$2" ;;
               --rpm-dir) rpmdir="$2" ;;
               --rollback-dir) olddir="$2" ;;
               --rpm-keyring) keyring="$2" ;;
@@ -2293,7 +2448,7 @@ updater_dispatch() {
     done
     case "$mode" in
        --plan) show_plan ;;
-       --build) build_rpms "$srpm" "$builder" ;;
+       --build) set_php_target "$branch" && build_rpms "$srpm" "$builder" ;;
        --update)
            if [ "$unattended" != "$backup_verified" ]; then
                err 'Для обновления без запросов параметры --unattended и --backup-verified нужны вместе.'
@@ -2372,8 +2527,10 @@ menu_install_rpms() {
 }
 
 menu_prepare_release() {
-    local new_path old_path signer output_path
-    echo 'Подготовка и подпись выпуска на доверенной сборочной машине.'
+    local new_path old_path signer output_path branch="${1:-8.2}"
+    local -a branch_args=()
+    [ "$branch" = 8.2 ] || branch_args=(--branch "$branch")
+    echo "Подготовка и подпись выпуска PHP $branch на доверенной сборочной машине."
     echo 'В любом поле Enter отменяет подготовку.'
     printf 'Каталог новых RPM: '
     IFS= read -r new_path || return 1
@@ -2387,7 +2544,7 @@ menu_prepare_release() {
     printf 'Каталог для подготовленного выпуска: '
     IFS= read -r output_path || return 1
     if [ -z "$output_path" ]; then echo 'Подготовка выпуска отменена.'; return 0; fi
-    bash "$SELF" --prepare-release --new-rpm-dir "$new_path" --old-rpm-dir "$old_path" --signer "$signer" --output "$output_path"
+    bash "$SELF" --prepare-release --new-rpm-dir "$new_path" --old-rpm-dir "$old_path" --signer "$signer" --output "$output_path" "${branch_args[@]}"
     return 0
 }
 
@@ -2399,9 +2556,11 @@ menu_update() {
         echo ' 1. Посмотреть план для этого сервера (по умолчанию)'
         echo ' 2. Подготовить и обновить из настроенного доверенного выпуска'
         echo ' 3. Настроить автоматическое обновление — один раз на клиенте'
-        echo ' 4. Собрать RPM на отдельной сборочной ВМ'
+        echo ' 4. Собрать RPM PHP 8.2 на отдельной сборочной ВМ'
         echo ' 5. Установить подписанные RPM вручную — расширенный режим'
-        echo ' 6. Подписать выпуск на доверенной сборочной машине'
+        echo ' 6. Подписать выпуск PHP 8.2 на доверенной сборочной машине'
+        echo ' 7. Собрать RPM PHP 8.3 на отдельной сборочной ВМ'
+        echo ' 8. Подписать выпуск PHP 8.3 на доверенной сборочной машине'
         echo ' 0. Назад'
         printf '\n Выберите действие [1]: '
         IFS= read -r choice || return 1
@@ -2412,6 +2571,8 @@ menu_update() {
           4) bash "$SELF" --build --builder ;;
           5) menu_install_rpms || return 1 ;;
           6) menu_prepare_release || return 1 ;;
+          7) bash "$SELF" --build --builder --branch 8.3 ;;
+          8) menu_prepare_release 8.3 || return 1 ;;
           0) return 0 ;;
           *) echo 'Неизвестный пункт меню.' ;;
         esac
@@ -2494,8 +2655,8 @@ check_site_dispatch() {
 setup_auto_update() (
     local config='/etc/bitrix-php-update.conf' keydir='/etc/bitrix-php-update' temp='' config_temp='' cli='' keyfile=''
     local selector='' unattended=0
-    local source='https://github.com/vitikevich-landau/bitrix-php82-updater/releases/download/php-8.2.35-el7-r1'
-    local key_url='https://raw.githubusercontent.com/vitikevich-landau/bitrix-php82-updater/main/release-keyring.gpg'
+    local source=''
+    local key_url='https://raw.githubusercontent.com/vitikevich-landau/bitrix-php-updater/main/release-keyring.gpg'
     local expected_key='7f07067817dfb211bb503e8f5a8e7c0a4b73d2e26154e9b07091548d1dcfb91c'
     require_root || return
     MANAGED_SITE=''
@@ -2512,6 +2673,7 @@ setup_auto_update() (
     done
     [ -t 0 ] || unattended=1
     profile_check || return
+    source="$PROJECT_RELEASE_URL"
     need curl sha256sum mktemp mv chmod gpgv dirname || return
     if [ -e "$config" ] || [ -L "$config" ]; then
         load_auto_config "$config" || return
@@ -3192,7 +3354,8 @@ if [ -z "$py" ]; then
 fi
 
 # Встроенная программа исполняется из stdin: --diagnose не создаёт .py-файлов на диске.
-sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGET_PHP="$TARGET_PHP" "$py" -B - "$@"
+audit_targets="$(set_php_target 8.2; printf '8.2=%s;' "$TARGET_PHP"; set_php_target 8.3; printf '8.3=%s' "$TARGET_PHP")"
+sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGETS="$audit_targets" "$py" -B - "$@"
 exit $?
 
 # Всё после этой строки — встроенный код Python, внутри heredoc для bash -n.
@@ -3218,7 +3381,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = '1.0.0-rc9'
+VERSION = '1.0.0-rc10'
 PHP_EOL = {'5.6': '2018-12-31', '7.0': '2019-01-10', '7.1': '2019-12-01',
            '7.2': '2020-11-30', '7.3': '2021-12-06', '7.4': '2022-11-28',
            '8.0': '2023-11-26', '8.1': '2025-12-31', '8.2': '2026-12-31',
@@ -3967,23 +4130,28 @@ def print_human(rep):
     print('=' * 66)
 
     cli_version = rep['php']['version']
-    target = os.environ.get('BITRIX_MASTER_TARGET_PHP', '')
+    targets = dict(item.split('=', 1) for item in os.environ.get('BITRIX_MASTER_TARGETS', '').split(';') if '=' in item)
+    target = targets.get(branch(cli_version), '')
     installed = tuple(map(int, cli_version.split('.'))) if cli_version else None
     pinned = tuple(map(int, target.split('.'))) if re.fullmatch(r'\d+\.\d+\.\d+', target) else None
     core_rpms = rep['rpm']['core_php']
+    if rep['php']['module_errors']:
+        status('critical', 'PHP CLI' + (f' {cli_version}' if cli_version else '') + ' — ошибки загрузки модулей')
     if not installed:
         status('warning', 'PHP CLI — версия не определена' + (f' (цель {target})' if pinned else ''))
     elif not pinned:
-        status('info', f'PHP CLI {cli_version} — цель мастера не задана')
-    elif rep['php']['module_errors']:
-        status('critical', f'PHP CLI {cli_version} — ошибки загрузки модулей')
-    elif installed == pinned:
-        level = 'info' if core_rpms['status'] in ('mismatch', 'incomplete', 'ambiguous') else 'ok'
-        status(level, f'PHP CLI {cli_version} — обновление до целевой версии не требуется')
-    elif installed < pinned:
-        status('warning', f'PHP CLI {cli_version} — версия ниже целевой {target}')
-    else:
-        status('info', f'PHP CLI {cli_version} — версия выше целевой {target}')
+        if installed >= (8, 4, 0):
+            status('warning', f'PHP CLI {cli_version} — обновление этой ветки не поддерживается; доступны только 8.2.x и 8.3.x')
+        else:
+            status('warning', f'PHP CLI {cli_version} — для перехода на PHP 8.2 нужен отдельный маршрут (--plan)')
+    elif not rep['php']['module_errors']:
+        if installed == pinned:
+            level = 'info' if core_rpms['status'] in ('mismatch', 'incomplete', 'ambiguous') else 'ok'
+            status(level, f'PHP CLI {cli_version} — обновление до целевой версии не требуется')
+        elif installed < pinned:
+            status('warning', f'PHP CLI {cli_version} — версия ниже целевой {target}')
+        else:
+            status('info', f'PHP CLI {cli_version} — версия выше целевой {target}')
 
     if core_rpms['status'] == 'ambiguous':
         found = ', '.join(p['name'] + ' ' + p['version'] + '-' + p['release']

@@ -25,7 +25,14 @@ gpg --export > keyring.gpg
 chmod 600 keyring.gpg
 UPDATER_STATE="$case_root/state"
 WORK_ROOT="$UPDATER_STATE/work"
-old_version=8.2.20
+test_branch="${2:-8.2}"
+case "$test_branch" in
+    8.2) initial_version=8.2.20 target_version=8.2.35 ;;
+    8.3) initial_version=8.3.8 target_version=8.3.36 ;;
+    *) echo 'Only fixture branches 8.2 and 8.3 are supported'; exit 2 ;;
+esac
+set_php_target "$test_branch"
+old_version="$initial_version"
 rpm() {
     local file
     for file in "$@"; do :; done
@@ -41,11 +48,11 @@ for name in php php-cli php-common; do
     record="$name|(none)|$old_version|1.el7|x86_64"
     printf '%s\n' "$record" >> installed
     printf '%s\n' "$record" > "old-input/$name-$old_version-1.el7.x86_64.rpm"
-    printf '%s\n' "$name|(none)|8.2.35|1.el7|x86_64" > "new-input/$name-8.2.35-1.el7.x86_64.rpm"
+    printf '%s\n' "$name|(none)|$target_version|1.el7|x86_64" > "new-input/$name-$target_version-1.el7.x86_64.rpm"
 done
 sort -o installed installed
 signer="$(gpg --with-colons --fingerprint --list-secret-keys | awk -F: '$1=="fpr"{print $10; exit}')"
-bash "$installer" --prepare-release --new-rpm-dir "$case_root/new-input" --old-rpm-dir "$case_root/old-input" --signer "$signer" --output "$case_root/source"
+bash "$installer" --prepare-release --branch "$test_branch" --new-rpm-dir "$case_root/new-input" --old-rpm-dir "$case_root/old-input" --signer "$signer" --output "$case_root/source"
 cmp -s keyring.gpg source/release-keyring.gpg
 printf 'PASS actual publisher-produced catalogs used by client\n'
 cp installed initial
@@ -54,7 +61,7 @@ chmod 600 client.conf
 php() { printf '%s' "$old_version"; }
 httpd() { return 0; }
 systemctl() { return 0; }
-profile_check() { PHP_CURRENT="$old_version"; }
+profile_check() { PHP_CURRENT="$old_version"; select_php_target_for_version "$PHP_CURRENT"; }
 inventory_php_rpms() { cat "$case_root/installed"; }
 http_check() { [ "${WEB_FAIL:-0}" = 0 ]; }
 check_disk() { return 0; }
@@ -102,6 +109,7 @@ expect_failure() {
       signed_unsafe_name) expected='Недопустимая строка в SHA256SUMS.' ;;
       partial_download) expected='fixture-partial-download' ;;
       missing_required_new_module) expected='Не найден подходящий RPM для php-mbstring (new).' ;;
+      wrong_new_branch) expected='Не найден подходящий RPM для php (new).' ;;
       *) echo "FAIL unknown negative fixture $label"; exit 1 ;;
     esac
     grep -Fq -- "$expected" "$case_root/out" || { cat "$case_root/out"; echo "FAIL wrong rejection for $label"; exit 1; }
@@ -112,7 +120,7 @@ auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-ver
 printf 'PASS local automatic preparation and existing installer handoff\n'
 
 # The OLD signature covers a fleet archive, while this host needs only three rows.
-extra='php-gd|(none)|8.2.20|1.el7|x86_64'
+extra="php-gd|(none)|$initial_version|1.el7|x86_64"
 extra_hash="$(printf '%s\n' "$extra" | sha256sum)"
 extra_name="php-gd-${extra_hash%% *}.rpm"
 printf '%s\n' "$extra" > "source/$extra_name"
@@ -182,17 +190,17 @@ auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-ver
 [ "$(cat result)" = updated ]
 printf 'PASS fresh HTTPS retry after partial download\n'
 cp good.conf client.conf
-old_version=8.2.35
+old_version="$target_version"
 rm -f keyring.gpg
 auto_update_dispatch --config "$case_root/client.conf"
 [ "$(cat result)" = already-current ]
 printf 'PASS already-target health route needs no artifacts\n'
 
 
-old_version=8.2.20
+old_version="$initial_version"
 cp source/release-keyring.gpg keyring.gpg
 chmod 600 keyring.gpg
-required='php-mbstring|(none)|8.2.20|1.el7|x86_64'
+required="php-mbstring|(none)|$initial_version|1.el7|x86_64"
 required_hash="$(printf '%s\n' "$required" | sha256sum)"
 required_name="php-mbstring-${required_hash%% *}.rpm"
 printf '%s\n' "$required" >> installed
@@ -203,3 +211,13 @@ printf '%s\n' "$required" > "source/$required_name"
 expect_failure missing_required_new_module auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
 grep -Fq 'Не найден подходящий RPM для php-mbstring (new).' "$case_root/out"
 printf 'PASS missing required NEW module blocks installation after exact OLD preparation\n'
+
+# A custom source is literal, and even signed RPMs from another branch cannot
+# reach the updater handoff. Re-sign with this test's ephemeral fixture key.
+cp initial installed
+if [ "$test_branch" = 8.3 ]; then wrong_version=8.2.35; else wrong_version=8.3.36; fi
+sed -i "s/$target_version/$wrong_version/" source/php-"$target_version"-1.el7.x86_64.rpm
+(cd source && sha256sum php-"$target_version"-1.el7.x86_64.rpm php-cli-"$target_version"-1.el7.x86_64.rpm php-common-"$target_version"-1.el7.x86_64.rpm > NEW-SHA256SUMS &&
+    gpg --batch --yes --armor --detach-sign --output NEW-SHA256SUMS.asc NEW-SHA256SUMS)
+expect_failure wrong_new_branch auto_update_dispatch --config "$case_root/client.conf" --unattended --backup-verified
+printf 'PASS signed custom release cannot switch PHP branch\n'

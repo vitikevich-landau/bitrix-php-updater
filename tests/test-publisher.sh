@@ -109,3 +109,28 @@ test ! -e "$root/wrongkey"
 signer="$saved"
 grep -Fq 'Закрытый ключ подписи не найден' "$root/out" || { cat "$root/out"; exit 1; }
 printf 'PASS unavailable signer rejected\n'
+
+# PHP 8.3 is a separate signed release. Old artifacts must stay on its branch.
+mkdir "$root/new83" "$root/old83"
+for name in php php-cli php-common; do
+    printf '%s|(none)|8.3.36|1.el7.custom|x86_64\n' "$name" > "$root/new83/$name.rpm"
+    printf '%s|(none)|8.3.8|1.el7.remi|x86_64\n' "$name" > "$root/old83/$name.rpm"
+done
+publish83() {
+    bash "$installer" --prepare-release --branch 8.3 --new-rpm-dir "$root/new83" --old-rpm-dir "$1" --signer "$signer" --output "$2"
+}
+publish83 "$root/old83" "$root/dist83" > "$root/out" 2>&1 || { cat "$root/out"; exit 1; }
+for kind in NEW OLD; do
+    gpgv --homedir "$root/verify" --keyring "$root/dist83/release-keyring.gpg" "$root/dist83/$kind-SHA256SUMS.asc" "$root/dist83/$kind-SHA256SUMS"
+    (cd "$root/dist83"; sha256sum --status -c "$kind-SHA256SUMS")
+done
+printf 'PASS branch 8.3 produces verified NEW and OLD catalogs\n'
+if publish83 "$root/old" "$root/crossbranch" > "$root/out" 2>&1; then echo 'accepted cross-branch OLD'; exit 1; fi
+test ! -e "$root/crossbranch"
+grep -Fq 'Неподходящий пакет для выпуска EL7 PHP 8.3' "$root/out" || { cat "$root/out"; exit 1; }
+printf 'PASS branch 8.3 rejects 8.2 OLD archive before publication\n'
+sed -i s/8.3.36/8.3.35/ "$root/new83/php.rpm"
+if publish83 "$root/old83" "$root/wrongpatch" > "$root/out" 2>&1; then echo 'accepted wrong NEW patch'; exit 1; fi
+test ! -e "$root/wrongpatch"
+grep -Fq 'Новый комплект должен содержать по одному RPM 8.3.36' "$root/out" || { cat "$root/out"; exit 1; }
+printf 'PASS branch 8.3 requires exact target patch in NEW archive\n'

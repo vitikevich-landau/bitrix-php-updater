@@ -164,6 +164,12 @@ chmod 0600 "$source/"*
 chmod 0700 "$source/rpm-rollback"
 platform_check() { :; }
 php() { echo EARLY_PHP >> "$LOG"; return 1; }
+rpm() {
+    case "${@: -1}" in
+        bitrix-env|bitrix-env-crm) printf 'package %s is not installed\n' "${@: -1}"; return 1 ;;
+        *) echo UNEXPECTED_RPM >> "$LOG"; return 99 ;;
+    esac
+}
 select_managed_site() { echo EARLY_DISCOVERY >> "$LOG"; return 1; }
 rpm_core_snapshot() { echo fixture; }
 plan_rpm_rollback() { echo keep; }
