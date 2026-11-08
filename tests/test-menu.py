@@ -26,6 +26,7 @@ cases = [
     ('empty rollback id cancels', '3\n2\n\n0\n0\n', ['Откат отменён'], ['CALL|--rollback']),
     ('rollback id chosen', '3\n2\n20261107T100000Z-123\n0\n0\n', ['CALL|--rollback|--session|20261107T100000Z-123'], []),
     ('optional isolated Python', '1\n7\n0\n0\n', ['CALL|--bootstrap-python'], []),
+    ('report comparison from checks menu', '1\n8\n0\n0\n', ['CALL|--compare-menu'], ['CALL|--audit', 'CALL|--update']),
     ('help from main', '4\n0\n', ['CALL|--help'], []),
     ('missing old bundle cancels', '2\n5\n/root/new\n\n0\n0\n', ['Установка отменена'], ['CALL|--update']),
     ('missing keyring cancels', '2\n5\n/root/new\n/root/old\n\n0\n0\n', ['Установка отменена'], ['CALL|--update']),

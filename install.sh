@@ -2216,6 +2216,7 @@ BITRIX SERVER MASTER 1.0.0-rc11 — диагностика и обновлени
   bash install.sh --audit
   bash install.sh --audit --offline --report ./audit-full.json
   bash install.sh --audit --json
+  bash install.sh --compare-menu
 
 --check проверяет целевую версию PHP без Python и доступа к интернету.
 С --url он проверяет настроенный локальный маршрут веб-PHP.
@@ -2225,6 +2226,7 @@ BITRIX SERVER MASTER 1.0.0-rc11 — диагностика и обновлени
 Это проверка PHP/расширений через Apache; nginx, БД и функции Битрикса
 проверяйте отдельно. --check и --audit временные тесты не создают.
 --audit собирает данные, сверяет патч PHP с PHP.net и сохраняет JSON.
+В меню 1 → 8 можно выбрать сохранённые отчёты по номерам и сравнить их.
 --plan показывает цепочку перехода на PHP 8.2 для обнаруженного BitrixEnv.
 Переходы между ветками администратор запускает через меню /root/menu.sh.
 На подходящем PHP 8.2.x он показывает патч до 8.2.35, на 8.3.x — до 8.3.36.
@@ -2726,6 +2728,7 @@ menu_next_actions() {
         menu_option check 'Выполнить быструю проверку'
         menu_option site 'Проверить PHP сайта'
     fi
+    [ "$action" != --audit ] || menu_option compare 'Сравнить сохранённые отчёты — до и после'
     while :; do
         echo
         for i in "${!MENU_OPTIONS[@]}"; do printf ' %s. %s\n' "$((i+1))" "${MENU_LABELS[$i]}"; done
@@ -2738,6 +2741,7 @@ menu_next_actions() {
         fi
         MENU_NEXT="${MENU_OPTIONS[$((10#$choice-1))]}"
         if [ "$MENU_NEXT" = details ]; then menu_session_details "$MENU_SESSION"; MENU_NEXT=''; continue; fi
+        if [ "$MENU_NEXT" = compare ]; then bash "$SELF" --compare-menu; MENU_NEXT=''; continue; fi
         return 0
     done
 }
@@ -2784,6 +2788,7 @@ menu_checks() {
         echo ' 5. Проверить PHP сайта автоматически — временный закрытый тест'
         echo ' 6. Подробная диагностика на экране без сети'
         echo ' 7. Подготовить отдельный Python для полного аудита'
+        echo ' 8. Сравнить сохранённые отчёты — до и после'
         echo ' 0. Назад'
         printf '\n Выберите действие [1]: '
         IFS= read -r choice || return 1
@@ -2795,6 +2800,7 @@ menu_checks() {
           5) menu_action --check-site || return 1 ;;
           6) menu_action --diagnose --full --offline || return 1 ;;
           7) bash "$SELF" --bootstrap-python ;;
+          8) bash "$SELF" --compare-menu ;;
           0) return 0 ;;
           *) echo 'Неизвестный пункт меню.' ;;
         esac
@@ -3659,13 +3665,21 @@ fi
 
 py="$(python_path)"
 if [ -z "$py" ]; then
+    case "${1:-}" in
+        --compare|--compare-menu)
+            err 'Для сравнения нужен Python 3.8+. В меню 1 → 7 можно подготовить отдельный Python, затем 1 → 3 — сохранить полный отчёт.'
+            exit 3 ;;
+    esac
     fallback_diagnose "$@"
     exit $?
 fi
 
 # Встроенная программа исполняется из stdin: --diagnose не создаёт .py-файлов на диске.
 audit_targets="$(set_php_target 8.2; printf '8.2=%s;' "$TARGET_PHP"; set_php_target 8.3; printf '8.3=%s' "$TARGET_PHP")"
-sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGETS="$audit_targets" "$py" -B - "$@"
+# FD 4 сохраняет ввод пользователя: stdin Python занят встроенным кодом.
+{
+    sed -n '/^__PYTHON_PAYLOAD_START__$/,/^__PYTHON_PAYLOAD_END__$/p' "$SELF" | sed '1d;$d' | BITRIX_MASTER_TARGETS="$audit_targets" BITRIX_MASTER_SCRIPT_DIR="$(dirname -- "$SELF")" "$py" -B - "$@"
+} 4<&0
 exit $?
 
 # Всё после этой строки — встроенный код Python, внутри heredoc для bash -n.
@@ -4618,15 +4632,78 @@ def reported_bitrix_version(report):
     return ver
 
 
+def report_text(value):
+    """Report contents and filenames are data, never terminal escape sequences."""
+    text = 'неизвестно' if value is None else str(value)
+    return ''.join(c if c.isprintable() else repr(c)[1:-1] for c in text)[:500]
+
+
+def report_status(level, text):
+    label, color = {'ok': ('OK', 32), 'warning': ('ВНИМАНИЕ', 33),
+                    'critical': ('КРИТИЧНО', 31), 'info': ('ИНФО', 36)}[level]
+    line = '[' + label + '] ' + report_text(text)
+    if sys.stdout.isatty() and os.environ.get('TERM') != 'dumb' and not os.environ.get('NO_COLOR'):
+        line = f'\x1b[{color}m{line}\x1b[0m'
+    print(line)
+
+
+def report_date(report):
+    stamp = report.get('timestamp_utc')
+    if not isinstance(stamp, str) or 'T' not in stamp:
+        raise ValueError('В отчёте отсутствует корректная дата диагностики.')
+    try:
+        value = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+    except (ValueError, OverflowError) as e:
+        raise ValueError('В отчёте некорректная дата диагностики.') from e
+
+
+def load_report(path):
+    # O_NONBLOCK and fstat also cover a regular file replaced by a FIFO during discovery.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as fh:
+        meta = os.fstat(fh.fileno())
+        limit = 8 * 1024 * 1024
+        if not stat.S_ISREG(meta.st_mode) or meta.st_size > limit:
+            raise ValueError('Ожидался обычный JSON-файл размером не более 8 МиБ.')
+        raw = fh.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError('Отчёт превышает 8 МиБ.')
+    obj = json.loads(raw.decode('utf-8'))
+    if not isinstance(obj, dict) or obj.get('schema') != 'bitrix-server-master/diagnostic-v1':
+        raise ValueError('Нужен полный JSON-отчёт Bitrix Server Master: ' + report_text(path))
+    if not isinstance(obj.get('hostname'), str) or not obj['hostname'].strip():
+        raise ValueError('В отчёте отсутствует имя сервера.')
+    report_date(obj)
+    if obj.get('mode') not in ('quick', 'standard', 'full'):
+        raise ValueError('В отчёте отсутствует режим диагностики.')
+    for section, field in [('system', 'name'), ('bitrix', 'version'), ('php', 'version')]:
+        data = obj.get(section)
+        if not isinstance(data, dict) or field not in data or not isinstance(data[field], (str, type(None))):
+            raise ValueError('В отчёте отсутствуют или повреждены данные: ' + section)
+    web = obj.get('web')
+    if not isinstance(web, dict):
+        raise ValueError('В отчёте отсутствуют сведения о веб-сервере.')
+    for name in ('apache', 'nginx'):
+        data = web.get(name)
+        if not isinstance(data, dict) or 'version' not in data or not isinstance(data['version'], (str, type(None))):
+            raise ValueError('В отчёте отсутствуют или повреждены данные: ' + name)
+    if 'active' not in web['apache'] or not isinstance(web['apache']['active'], (str, bool, type(None))):
+        raise ValueError('В отчёте отсутствует состояние службы Apache.')
+    alerts = obj.get('alerts')
+    if not isinstance(alerts, list) or any(
+            not isinstance(a, dict) or not isinstance(a.get('code'), str) or not a['code'] or
+            a.get('level') not in ('info', 'warning', 'critical', 'ok') or
+            not isinstance(a.get('title', ''), str) or not isinstance(a.get('detail', ''), str)
+            for a in alerts):
+        raise ValueError('В отчёте повреждён список предупреждений.')
+    return obj
+
+
 def compare_reports(paths, json_out):
-    reports = []
-    for p in paths:
-        with open(p, 'r', encoding='utf-8') as fh:
-            obj = json.load(fh)
-        if not isinstance(obj, dict) or obj.get('schema') != 'bitrix-server-master/diagnostic-v1':
-            raise ValueError('Файл не является отчётом Bitrix Server Master: ' + p)
-        reports.append(obj)
-    old, new = reports
+    old, new = [load_report(p) for p in paths]
     if old.get('hostname') != new.get('hostname'):
         raise ValueError('Отчёты относятся к разным именам серверов. Сравнение отменено.')
     changes = []
@@ -4652,15 +4729,183 @@ def compare_reports(paths, json_out):
     if json_out:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print('СРАВНЕНИЕ ОТЧЁТОВ:', result['server'])
-        print('Было:', result['before'], '| Стало:', result['after'])
+        print('\nСРАВНЕНИЕ ОТЧЁТОВ:', report_text(result['server']))
+        print('ДО:   ', report_text(paths[0]))
+        print('ПОСЛЕ:', report_text(paths[1]))
+        print('Было:', report_text(result['before']), '| Стало:', report_text(result['after']))
+        scope_changed = (old.get('mode') != new.get('mode') or
+                         old.get('update_check') != new.get('update_check') or
+                         old.get('site_probe') != new.get('site_probe'))
+        if scope_changed:
+            report_status('warning', 'Условия проверки различаются (режим, проверка обновлений или сайта). '
+                          'Исчезновение предупреждения само по себе не доказывает исправление.')
+        if report_date(old) >= report_date(new):
+            report_status('warning', 'Отчёт «после» не новее отчёта «до». Проверьте порядок файлов.')
+        print('\nИзменения версий и служб:')
         if not changes:
             print('Изменений по отслеживаемым полям не найдено.')
         for x in changes:
-            print(' - {component}: {before} -> {after}'.format(**x))
-        print('Исчезли предупреждения:', ', '.join(result['resolved_alerts']) or 'нет')
-        print('Появились предупреждения:', ', '.join(result['new_alerts']) or 'нет')
+            report_status('info', '{}: {} → {}'.format(x['component'], report_text(x['before']), report_text(x['after'])))
+        old_alerts = {a['code']: a for a in old['alerts']}
+        new_alerts = {a['code']: a for a in new['alerts']}
+        for heading, codes, source, resolved in [
+                ('Больше не отмечены в новом отчёте', a_codes - b_codes, old_alerts, True),
+                ('Появились в новом отчёте', b_codes - a_codes, new_alerts, False),
+                ('Остались в новом отчёте', a_codes & b_codes, new_alerts, False)]:
+            print('\n' + heading + ':')
+            if not codes:
+                print('  нет')
+            for code in sorted(codes):
+                alert = source[code]
+                level = ('info' if scope_changed else 'ok') if resolved else alert['level']
+                report_status(level, alert.get('title') or code)
+                if alert.get('detail'):
+                    print('  ' + report_text(alert['detail']))
+        critical = sum(a['level'] == 'critical' for a in new['alerts'])
+        warnings = sum(a['level'] == 'warning' for a in new['alerts'])
+        if critical or warnings:
+            report_status('critical' if critical else 'warning',
+                          f'В отчёте «после»: критических проблем — {critical}, предупреждений — {warnings}. '
+                          'Посмотрите причины выше.')
+        else:
+            report_status('ok', 'В отчёте «после» нет критических проблем и предупреждений.')
+        report_status('info', 'Это сравнение сохранённых данных. Текущее состояние сервера и работа сайта заново не проверялись.')
     return 0
+
+
+def discover_reports(directories):
+    reports, seen, skipped = [], set(), 0
+    for directory in dict.fromkeys(os.path.abspath(os.path.expanduser(p)) for p in directories):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith('.json') or not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        meta = entry.stat(follow_symlinks=False)
+                        identity = (meta.st_dev, meta.st_ino)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        obj = load_report(entry.path)
+                        reports.append((entry.path, obj))
+                    except (OSError, ValueError, RecursionError):
+                        skipped += 1
+        except OSError as e:
+            report_status('warning', 'Не удалось прочитать каталог: ' + directory + ' — ' + str(e))
+    reports.sort(key=lambda item: (report_date(item[1]), item[0]), reverse=True)
+    return reports, skipped
+
+
+def report_choice(terminal, prompt, count):
+    while True:
+        print(prompt, end='', flush=True)
+        value = terminal.readline()
+        if not value:
+            return None
+        value = value.strip()
+        if value in ('', '0'):
+            return None
+        if re.fullmatch(r'[1-9][0-9]{0,5}', value) and int(value) <= count:
+            return int(value)
+        print('Неизвестный пункт. Выберите номер из списка; Enter или 0 — назад.')
+
+
+def choose_report(terminal, reports, title):
+    print('\n' + title)
+    for i, (path, obj) in enumerate(reports, 1):
+        php = obj.get('php')
+        version = php.get('version') if isinstance(php, dict) else None
+        print(' {}. {} UTC | {} | PHP {}'.format(i, report_date(obj).strftime('%d.%m.%Y %H:%M:%S'),
+                                               report_text(obj['hostname']), report_text(version)))
+        print('    ' + report_text(path))
+    answer = report_choice(terminal, 'Номер отчёта [0 — назад]: ', len(reports))
+    return reports[answer - 1] if answer else None
+
+
+def latest_report_pair(reports):
+    pairs = {}
+    for item in reports:  # Discovery is sorted newest first.
+        host = item[1]['hostname']
+        group = pairs.setdefault(host, [])
+        if not group or (len(group) == 1 and report_date(item[1]) < report_date(group[0][1])):
+            group.append(item)
+    pairs = {host: group for host, group in pairs.items() if len(group) == 2}
+    pair = pairs.get(socket.gethostname())
+    if pair is None and len(pairs) == 1:
+        pair = next(iter(pairs.values()))
+    return (pair[1], pair[0]) if pair else None
+
+
+def compare_menu(terminal):
+    if not terminal.isatty():
+        print('Для выбора отчётов нужен терминал.', file=sys.stderr)
+        return 2
+    directories = [os.getcwd(), os.environ.get('BITRIX_MASTER_SCRIPT_DIR', os.getcwd()), str(Path.home())]
+    while True:
+        print('\nСРАВНЕНИЕ СОХРАНЁННЫХ ОТЧЁТОВ — ДО И ПОСЛЕ')
+        print('Поиск JSON без вложенных папок:')
+        for directory in dict.fromkeys(directories):
+            print('  ' + report_text(directory))
+        reports, skipped = discover_reports(directories)
+        print('Найдено полных отчётов:', len(reports))
+        if skipped:
+            report_status('warning', f'Пропущено неподходящих или повреждённых JSON: {skipped}. '
+                          'Сокращённые отчёты без Python не подходят для сравнения.')
+        if len(reports) < 2:
+            report_status('info', 'Нужны два полных отчёта одного сервера: сохраните аудит до и после работ '
+                          'через меню 1 → 3 или выберите папку с прежними отчётами.')
+        pair = latest_report_pair(reports)
+        print('\n 1. Сравнить два последних отчёта одного сервера' +
+              (' — ' + report_text(pair[0][1]['hostname']) if pair else ' (пара пока не определена)'))
+        if pair:
+            for label, item in zip(('ДО', 'ПОСЛЕ'), pair):
+                print('    {}: {} UTC | {}'.format(label, report_date(item[1]).strftime('%d.%m.%Y %H:%M:%S'),
+                                                   report_text(os.path.basename(item[0]))))
+        print(' 2. Выбрать отчёты «до» и «после» из списка')
+        print(' 3. Найти отчёты в другой папке')
+        print(' 0. Назад (Enter)')
+        answer = report_choice(terminal, 'Выберите действие [0]: ', 3)
+        if answer is None:
+            return 0
+        if answer == 3:
+            print('Папка с отчётами (Enter — отмена): ', end='', flush=True)
+            directory = terminal.readline()
+            if not directory:
+                return 0
+            directory = directory.strip()
+            if directory:
+                directory = os.path.abspath(os.path.expanduser(directory))
+                if os.path.isdir(directory):
+                    directories = [directory]
+                else:
+                    report_status('warning', 'Каталог не найден: ' + directory)
+            continue
+        if answer == 1 and not pair:
+            report_status('warning', 'Нужны два отчёта одного сервера с разными датами. '
+                          'Если серверов несколько, выберите отчёты вручную пунктом 2.')
+            continue
+        if answer == 2:
+            if not reports:
+                continue
+            before = choose_report(terminal, reports, 'Выберите отчёт ДО работ:')
+            if before is None:
+                continue
+            candidates = [item for item in reports if item[1]['hostname'] == before[1]['hostname'] and
+                          report_date(item[1]) > report_date(before[1])]
+            if not candidates:
+                report_status('warning', 'Более нового отчёта этого сервера нет. Выберите более ранний отчёт ДО '
+                              'или сохраните новый аудит через меню 1 → 3.')
+                continue
+            after = choose_report(terminal, candidates, 'Выберите отчёт ПОСЛЕ работ (тот же сервер, более новая дата):')
+            if after is None:
+                continue
+            pair = (before, after)
+        try:
+            # Re-read the chosen files: removal or replacement is a recoverable error.
+            return compare_reports([item[0] for item in pair], False)
+        except (OSError, ValueError, RecursionError) as e:
+            report_status('critical', 'Не удалось сравнить отчёты: ' + str(e))
 
 
 def parse_args(argv):
@@ -4675,6 +4920,7 @@ def parse_args(argv):
     parser.add_argument('--offline', action='store_true', help='не обращаться к сети')
     parser.add_argument('--url', metavar='URL', help='проверить HTTP-ответ указанного сайта HEAD-запросом (оставляет запись в access.log)')
     parser.add_argument('--compare', nargs=2, metavar=('СТАРЫЙ_JSON', 'НОВЫЙ_JSON'), help='сравнить два сохранённых отчёта')
+    parser.add_argument('--compare-menu', action='store_true', help='выбрать сохранённые отчёты в меню')
     parser.add_argument('--version', action='version', version='Bitrix Server Master ' + VERSION)
     return parser.parse_args(argv)
 
@@ -4725,11 +4971,14 @@ def diagnose(args):
 def main():
     argv = sys.argv[1:]
     args = parse_args(argv)
+    if args.compare_menu:
+        with os.fdopen(os.dup(4), 'r', encoding='utf-8') as terminal:
+            return compare_menu(terminal)
     if args.compare:
         try:
             return compare_reports(args.compare, args.json)
-        except (OSError, ValueError, json.JSONDecodeError) as e:
-            print('Ошибка сравнения: ' + str(e), file=sys.stderr)
+        except (OSError, ValueError, RecursionError) as e:
+            print('Ошибка сравнения: ' + report_text(e), file=sys.stderr)
             return 3
     if argv or args.diagnose:
         return diagnose(args)

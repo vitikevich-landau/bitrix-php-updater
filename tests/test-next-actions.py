@@ -188,10 +188,14 @@ def pty_case(name, setup, action, choices=(), forbidden=(), calls=None, expected
                         pending = ''
                 elif child.poll() is not None:
                     break
-            if child.poll() is None:
+            # Closing the last PTY descriptor can report EIO just before the
+            # kernel marks the child exited. Allow that normal exit to finish.
+            try:
+                rc = child.wait(timeout=.5)
+            except subprocess.TimeoutExpired:
                 child.kill()
                 absent.append('prompt timed out')
-            rc = child.wait()
+                rc = child.wait()
         finally:
             if child.poll() is None:
                 child.kill()
@@ -333,6 +337,17 @@ for action in ['--plan', '--audit --offline', '--setup-update']:
     pty_case(action + ' exposes explicit preparation shortcut', child_stub,
              'menu_action ' + action, [AUTO],
              calls=['CALL|' + action.replace(' ', '|'), 'CALL|--auto-update'])
+
+comparison_stub = child_stub + r'''
+bash() {
+    [ "$1" = "$SELF" ] || return 99
+    shift
+    printf 'CALL' >> "$EVENTS"; printf '|%s' "$@" >> "$EVENTS"; printf '\n' >> "$EVENTS"
+}
+'''
+pty_case('audit follow-up opens report selection and returns to next actions', comparison_stub,
+         'menu_action --audit --offline', ['Сравнить.*отчёты'],
+         calls=['CALL|--audit|--offline', 'CALL|--compare-menu'])
 
 for action, summary in [('--check-site', 'Проверка сайта отменена'),
                         ('--setup-update', 'Настройка отменена')]:
