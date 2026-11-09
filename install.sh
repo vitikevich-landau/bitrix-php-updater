@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Bitrix Server Master 1.0.0-rc11 — диагностика и обновление PHP 8.2.35 / 8.3.36.
+# Bitrix Server Master 1.0.0-rc12 — диагностика и обновление PHP 8.2.35 / 8.3.36.
 set -o pipefail
 umask 077
 export LC_ALL=C
-MASTER_VERSION='1.0.0-rc11'
+MASTER_VERSION='1.0.0-rc12'
 MANAGED_SITE=''
 MENU_RESULT_ENABLED=0
+# Адрес и ключ отдельного прокси. Пароль никогда не хранится в установщике.
+RELAY_HOST='31.130.132.194'
+RELAY_SSH_PORT=2222
+RELAY_USER='relay'
+RELAY_FINGERPRINT='SHA256:DXlwUOYrx9brdSSIW72VQL4CGvS/5G8onnqri6LBflg'
+RELAY_STATE=''
+RELAY_INTERACTIVE=0
 PY_RELEASE='3.11.18'
 PY_BUILD='20261026'
 PY_ARTIFACT='cpython-3.11.18+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
@@ -156,8 +163,7 @@ bootstrap_python() {
             return 5
         fi
         echo 'Скачивание Python по HTTPS (без -k / --insecure)...'
-        if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
-                  --connect-timeout 12 --max-time 240 --output "$tmp/archive.tar.gz" "$PY_URL"; then
+        if ! download_transport "$PY_URL" "$tmp/archive.tar.gz" 240; then
             err 'скачивание не удалось. Системные пакеты не тронуты.'
             rm -rf -- "$tmp"
             return 5
@@ -895,12 +901,160 @@ CentOS 7 снята с поддержки. Обновление PHP не вос�
 EOF
 }
 
+# Владельцем туннеля является внешний процесс операции, а не вложенные
+# setup/run_auto_update: у них собственные EXIT-trap и отдельные subshell.
+with_download_context() (
+    local RELAY_STATE='' RELAY_INTERACTIVE=0 arg
+    [ ! -t 0 ] || RELAY_INTERACTIVE=1
+    for arg in "$@"; do
+        [ "$arg" != --unattended ] || RELAY_INTERACTIVE=0
+    done
+    RELAY_STATE="$(mktemp -d /tmp/bitrix-relay.XXXXXXXX)" || return 30
+    chmod 0700 -- "$RELAY_STATE" || { rmdir -- "$RELAY_STATE"; return 30; }
+    relay_context_exit() {
+        local rc=$?
+        trap - EXIT HUP INT TERM
+        relay_cleanup
+        exit "$rc"
+    }
+    trap relay_context_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$@"
+)
+
+relay_cleanup() {
+    [ -n "$RELAY_STATE" ] && [ -d "$RELAY_STATE" ] && [ ! -L "$RELAY_STATE" ] || return 0
+    if [ -S "$RELAY_STATE/control" ]; then
+        ssh -F /dev/null -S "$RELAY_STATE/control" -O exit -p "$RELAY_SSH_PORT" \
+            "$RELAY_USER@$RELAY_HOST" </dev/null >/dev/null 2>&1 3>&- 9>&- || true
+    fi
+    # Удаляем только известные файлы собственного mktemp-каталога.
+    rm -f -- "$RELAY_STATE/control" "$RELAY_STATE/known_hosts" "$RELAY_STATE/ssh.log" \
+        "$RELAY_STATE/port" "$RELAY_STATE/ready" "$RELAY_STATE/attempted"
+    rmdir -- "$RELAY_STATE" 2>/dev/null || true
+    return 0
+}
+
+relay_is_ready() {
+    [ -n "$RELAY_STATE" ] && [ -f "$RELAY_STATE/ready" ] || return 1
+    ssh -F /dev/null -S "$RELAY_STATE/control" -O check -p "$RELAY_SSH_PORT" \
+        "$RELAY_USER@$RELAY_HOST" </dev/null >/dev/null 2>&1 3>&- 9>&-
+}
+
+relay_start() {
+    local fingerprints line bits fingerprint rest count=0 port attempt listener
+    # fd0 здесь может быть манифестом в while-read. Терминал проверен внешним
+    # владельцем операции, а пароль OpenSSH читает отдельно через /dev/tty.
+    if [ -z "$RELAY_STATE" ] || [ "$RELAY_INTERACTIVE" != 1 ]; then
+        err 'GitHub недоступен. Для подключения через прокси запустите эту операцию в терминале без --unattended.'
+        return 30
+    fi
+    # Не повторяем запросы пароля для каждого RPM после неудачного входа.
+    if [ -e "$RELAY_STATE/attempted" ]; then
+        err 'Соединение с прокси не установлено или прервано. Повторите операцию.'
+        return 30
+    fi
+    : > "$RELAY_STATE/attempted" || return 30
+    need ssh ssh-keyscan ssh-keygen ss || return 30
+    printf '\nGitHub напрямую недоступен. Попробуем через прокси %s:%s.\n' "$RELAY_HOST" "$RELAY_SSH_PORT" >&2
+    # Сканирование само по себе не является доверием: сверяем каждый полученный
+    # ключ с отпечатком, переданным владельцем при установке прокси.
+    if ! ssh-keyscan -T 8 -p "$RELAY_SSH_PORT" -t ed25519 "$RELAY_HOST" \
+            > "$RELAY_STATE/known_hosts" 2> "$RELAY_STATE/ssh.log"; then
+        err "Прокси $RELAY_HOST:$RELAY_SSH_PORT не отвечает. Проверьте доступ к этому порту."
+        return 30
+    fi
+    fingerprints="$(ssh-keygen -l -E sha256 -f "$RELAY_STATE/known_hosts" 2>/dev/null)" || {
+        err 'Не удалось проверить ключ прокси.'; return 30;
+    }
+    while IFS= read -r line; do
+        read -r bits fingerprint rest <<< "$line"
+        if [ "$bits" != 256 ] || [ "$fingerprint" != "$RELAY_FINGERPRINT" ] || [[ "$rest" != *'(ED25519)' ]]; then
+            err 'Ключ прокси отличается от закреплённого. Передача пароля запрещена.'
+            return 30
+        fi
+        count=$((count + 1))
+    done <<< "$fingerprints"
+    [ "$count" -eq 1 ] || { err 'Неоднозначный ключ прокси.'; return 30; }
+    # Не используем фиксированный порт ручной проверки или чужой туннель.
+    port=''
+    for attempt in 1 2 3 4 5; do
+        port=$((40000 + RANDOM % 20000))
+        listener="$(ss -H -ltn "sport = :$port")" || return 30
+        [ -n "$listener" ] || break
+        port=''
+    done
+    [ -n "$port" ] || { err 'Не найден свободный локальный порт для прокси.'; return 30; }
+    printf '%s\n' "$port" > "$RELAY_STATE/port" || return 30
+    printf 'Введите пароль прокси. Соединение запустится в фоне; второе окно не нужно.\n' >&2
+    # Пароль читает OpenSSH через /dev/tty. Он не попадает в Bash, argv, env,
+    # журнал обновления или конфигурацию. Фоновый SSH не наследует fd меню/lock.
+    if ! ssh -F /dev/null -fNT -M -S "$RELAY_STATE/control" \
+            -D "127.0.0.1:$port" -p "$RELAY_SSH_PORT" \
+            -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ExitOnForwardFailure=yes \
+            -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$RELAY_STATE/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o PreferredAuthentications=password -o PasswordAuthentication=yes \
+            -o PubkeyAuthentication=no -o BatchMode=no -o NumberOfPasswordPrompts=3 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+            "$RELAY_USER@$RELAY_HOST" </dev/null >/dev/null 2> "$RELAY_STATE/ssh.log" 3>&- 9>&-; then
+        err 'Не удалось войти на прокси. Проверьте пароль и повторите операцию.'
+        cat -- "$RELAY_STATE/ssh.log" >&2
+        return 30
+    fi
+    : > "$RELAY_STATE/ready" || return 30
+    if ! relay_is_ready; then
+        err 'SSH завершился до готовности прокси.'
+        return 30
+    fi
+    printf 'Прокси подключён. Продолжаю скачивание; соединение закроется автоматически.\n' >&2
+}
+
+download_transport() {
+    local url="$1" path="$2" max_time="${3:-600}" github=0 http='' rc=0 port
+    local direct_retry=2 connect_timeout=15
+    local -a proxy_args=()
+    need curl || return
+    case "$url" in
+        https://github.com/*|https://raw.githubusercontent.com/*|https://release-assets.githubusercontent.com/*)
+            github=1; direct_retry=0; connect_timeout=8 ;;
+    esac
+    if [ "$github" = 1 ] && [ -n "$RELAY_STATE" ] && [ -f "$RELAY_STATE/ready" ]; then
+        relay_is_ready || { err 'Соединение с прокси прервано. Повторите операцию.'; return 30; }
+    else
+        # Без retry перед резервным маршрутом: блокировка не должна держать
+        # администратора несколько минут. Низкая скорость ограничивает зависания.
+        http="$(curl -q --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry "$direct_retry" --connect-timeout "$connect_timeout" --max-time "$max_time" --speed-limit 1 --speed-time 15 \
+            --output "$path" --write-out '%{http_code}' "$url")" || rc=$?
+        [ "$rc" -ne 0 ] || return 0
+        [ "$github" = 1 ] || return "$rc"
+        case "$rc:$http" in
+            5:*|6:*|7:*|28:*|35:*|52:*|55:*|56:*|60:*|22:403|22:408|22:429|22:500|22:502|22:503|22:504) ;;
+            *) return "$rc" ;;
+        esac
+        relay_start || return 30
+    fi
+    port="$(cat -- "$RELAY_STATE/port")" || return 30
+    [[ "$port" =~ ^[0-9]{5}$ ]] && [ "$port" -ge 40000 ] && [ "$port" -lt 60000 ] || return 30
+    proxy_args=(--noproxy '' --socks5-hostname "127.0.0.1:$port")
+    # Только конкретное скачивание идёт через прокси. Локальные проверки сайта
+    # и процессы rpm/yum не получают глобальных proxy-переменных.
+    curl -q "${proxy_args[@]}" --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 2 --connect-timeout 10 --max-time "$max_time" --speed-limit 1 --speed-time 30 \
+        --output "$path" "$url"
+}
+
 safe_download() {
     local url="$1" path="$2"
     need curl || return
     msg "Скачивание: $url"
-    curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
-         --retry 2 --connect-timeout 15 --max-time 600 --output "$path.part" "$url" || return 30
+    if ! download_transport "$url" "$path.part"; then
+        rm -f -- "$path.part"
+        return 30
+    fi
     [ -s "$path.part" ] || { err 'Скачан пустой файл.'; return 30; }
     mv -f -- "$path.part" "$path"
 }
@@ -2208,7 +2362,7 @@ show_status() {
 
 update_help() {
     cat <<'EOF'
-BITRIX SERVER MASTER 1.0.0-rc11 — диагностика и обновление PHP 8.2 / 8.3
+BITRIX SERVER MASTER 1.0.0-rc12 — диагностика и обновление PHP 8.2 / 8.3
 
 Проверка и отчёт
   bash install.sh --check
@@ -2261,6 +2415,9 @@ PHP 8.4+ и обновление BitrixEnv 9 не поддерживаются.
   bash install.sh --auto-update --site site.ru
 При первом запуске --auto-update сам настраивает выпуск, закреплённый ключ
 и автоматическую проверку сайта. Готовить PHP-файл или URL вручную не нужно.
+Если GitHub недоступен, мастер предложит прокси и запросит его пароль.
+Соединение работает в фоне в одном окне и закрывается после операции.
+Для этого нужен терминал; --unattended не запрашивает пароль прокси.
 --setup-update повторяет настройку; для выбора сайта можно добавить --site.
 Поддерживаются прежние конфигурации с HEALTH_URL=http(s)://... .
 
@@ -3601,12 +3758,12 @@ if [ "$#" -eq 0 ] && [ -t 0 ]; then full_menu; exit $?; fi
 case "${1:-}" in
   --setup-update)
       shift
-      setup_auto_update "$@"
+      with_download_context setup_auto_update "$@"
       exit $?
       ;;
   --auto-update)
       shift
-      auto_update_dispatch "$@"
+      with_download_context auto_update_dispatch "$@"
       exit $?
       ;;
   --prepare-release)
@@ -3626,7 +3783,11 @@ case "${1:-}" in
       ;;
   --plan|--build|--update|--rollback|--status)
       action="$1"; shift
-      updater_dispatch "$action" "$@"
+      if [ "$action" = --build ]; then
+          with_download_context updater_dispatch "$action" "$@"
+      else
+          updater_dispatch "$action" "$@"
+      fi
       exit $?
       ;;
 esac
@@ -3643,7 +3804,7 @@ if [ "${1:-}" = '--bootstrap-python' ]; then
         shift 2
     fi
     if [ "$#" -ne 0 ]; then echo 'Лишние аргументы режима --bootstrap-python.' >&2; exit 2; fi
-    bootstrap_python "$python_archive"
+    with_download_context bootstrap_python "$python_archive"
     exit $?
 fi
 
@@ -3710,7 +3871,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = '1.0.0-rc11'
+VERSION = '1.0.0-rc12'
 PHP_EOL = {'5.6': '2018-12-31', '7.0': '2019-01-10', '7.1': '2019-12-01',
            '7.2': '2020-11-30', '7.3': '2021-12-06', '7.4': '2022-11-28',
            '8.0': '2023-11-26', '8.1': '2025-12-31', '8.2': '2026-12-31',
